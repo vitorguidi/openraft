@@ -211,18 +211,18 @@ fn run_fuzz_test(config: &FuzzConfig, seed: u64, running: Arc<AtomicBool>) -> Fu
         .build_with_rng(rng);
 
     // Randomize Raft config based on seed
-    let raft_config = openraft::Config {
+    let raft_config = Arc::new(openraft::Config {
         heartbeat_interval: 100 + (seed % 100),
         election_timeout_min: 500 + (seed % 200),
         election_timeout_max: 1000 + (seed % 300),
         ..Default::default()
-    };
+    });
 
-    let (_cluster_info, cluster_state) = spawn_cluster(
+    let (cluster_info, cluster_state) = spawn_cluster(
         &mut sim,
         ClusterConfig {
             num_nodes: config.num_nodes,
-            raft_config,
+            raft_config: (*raft_config).clone(),
             seed,
         },
     );
@@ -231,6 +231,9 @@ fn run_fuzz_test(config: &FuzzConfig, seed: u64, running: Arc<AtomicBool>) -> Fu
     if config.enable_chaos {
         let chaos_seed = seed.wrapping_add(1000);
         let num_nodes = config.num_nodes;
+        let _cluster_info = cluster_info.clone();
+        let _cluster_state = cluster_state.clone();
+        let _raft_config = raft_config.clone();
 
         sim.client("chaos-agent", async move {
             let mut rng = StdRng::seed_from_u64(chaos_seed);
@@ -240,7 +243,7 @@ fn run_fuzz_test(config: &FuzzConfig, seed: u64, running: Arc<AtomicBool>) -> Fu
                 let delay = rng.gen_range(1000..5000);
                 tokio::time::sleep(Duration::from_millis(delay)).await;
 
-                let chaos_type = rng.gen_range(0..6);
+                let chaos_type = rng.gen_range(0..8);
                 match chaos_type {
                     0 => {
                         // Partition a random node
@@ -248,7 +251,7 @@ fn run_fuzz_test(config: &FuzzConfig, seed: u64, running: Arc<AtomicBool>) -> Fu
                         let victim_name = format!("node-{}", victim);
                         tracing::info!("CHAOS: partitioning {}", victim_name);
                         for i in 1..=num_nodes {
-                            if i != victim {
+                            if i != (victim as usize) {
                                 let other = format!("node-{}", i);
                                 turmoil::partition(victim_name.clone(), other);
                             }
@@ -285,6 +288,11 @@ fn run_fuzz_test(config: &FuzzConfig, seed: u64, running: Arc<AtomicBool>) -> Fu
                                 }
                             }
                         }
+                    }
+                    4 => {
+                        // Restart a random node
+                        let _victim = rng.gen_range(1..=(num_nodes as u64));
+                        // Handled in main loop for simplicity with Sim access
                     }
                     _ => {
                         // Do nothing - let system stabilize
@@ -374,6 +382,8 @@ fn run_fuzz_test(config: &FuzzConfig, seed: u64, running: Arc<AtomicBool>) -> Fu
     let mut steps: u64 = 0;
     let mut invariant_checks: u64 = 0;
     let mut violations: Vec<String> = Vec::new();
+    let mut chaos_rng = StdRng::seed_from_u64(seed.wrapping_add(3000));
+    let raft_config_arc = raft_config.clone();
 
     println!("Starting simulation...");
 
@@ -387,6 +397,12 @@ fn run_fuzz_test(config: &FuzzConfig, seed: u64, running: Arc<AtomicBool>) -> Fu
         if steps >= config.max_steps {
             println!("Reached max steps: {}", config.max_steps);
             break;
+        }
+
+        // Randomly restart a node (external chaos)
+        if config.enable_chaos && steps > 0 && steps % 1000 == 0 && chaos_rng.gen_bool(0.1) {
+            let victim = chaos_rng.gen_range(1..=(config.num_nodes as u64));
+            tests_turmoil::cluster::restart_node(&mut sim, victim);
         }
 
         // Step the simulation - keep stepping even when Ok(false)

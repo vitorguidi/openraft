@@ -105,6 +105,17 @@ impl Default for ClusterState {
     }
 }
 
+/// Register a node's storage in the shared state BEFORE starting it.
+pub fn register_node(
+    node_id: NodeId,
+    cluster_state: &Arc<std::sync::Mutex<ClusterState>>,
+) {
+    let mut state = cluster_state.lock().unwrap();
+    let (log_store, state_machine) = new_store();
+    state.log_stores.insert(node_id, log_store);
+    state.state_machines.insert(node_id, state_machine);
+}
+
 /// Spawn a cluster of Raft nodes in the turmoil simulation.
 ///
 /// Returns cluster info and a shared state for observing nodes.
@@ -124,81 +135,112 @@ pub fn spawn_cluster(
     let raft_config = Arc::new(config.raft_config);
     let cluster_state = Arc::new(std::sync::Mutex::new(ClusterState::new()));
 
-    // Spawn each node
+    // Register all nodes first (to initialize persistent storage)
+    for &node_id in &node_ids {
+        register_node(node_id, &cluster_state);
+    }
+
+    // Spawn each node host
     for &node_id in &node_ids {
         let raft_config = raft_config.clone();
         let all_nodes = nodes.clone();
-        let host_name = ClusterInfo::host_name(node_id);
         let cluster_state = cluster_state.clone();
-        let node_seed = config.seed.wrapping_add(node_id);
+        let host_name = ClusterInfo::host_name(node_id);
+        let seed = config.seed;
 
         sim.host(host_name, move || {
             let raft_config = raft_config.clone();
             let all_nodes = all_nodes.clone();
             let cluster_state = cluster_state.clone();
-            let rng = RefCell::new(SmallRng::seed_from_u64(node_seed));
+            let node_seed = seed.wrapping_add(node_id);
 
-            DETERMINISTIC_RNG.scope(rng, async move {
-                // Start RPC server FIRST so other nodes can connect
-                let listener = TcpListener::bind("0.0.0.0:9000").await.expect("Failed to bind");
-                tracing::info!(node_id, "RPC server listening");
+            async move {
+                let rng = RefCell::new(SmallRng::seed_from_u64(node_seed));
 
-                // Create storage
-                let (log_store, state_machine) = new_store();
+                let res: Result<(), Box<dyn std::error::Error>> = DETERMINISTIC_RNG.scope(rng, async move {
+                    // Start RPC server FIRST so other nodes can connect
+                    let listener = TcpListener::bind("0.0.0.0:9000").await.expect("Failed to bind");
+                    tracing::info!(node_id, "RPC server listening");
 
-                // Create network factory
-                let network = TurmoilNetwork;
+                    // Get existing storage from shared state
+                    let (log_store, state_machine) = {
+                        let state = cluster_state.lock().unwrap();
+                        (
+                            state.log_stores.get(&node_id).expect("node not registered").clone(),
+                            state.state_machines.get(&node_id).expect("node not registered").clone(),
+                        )
+                    };
 
-                // Create Raft instance
-                let raft = openraft::Raft::new(
-                    node_id,
-                    raft_config,
-                    network,
-                    log_store.clone(),
-                    state_machine.clone(),
-                )
-                .await
-                .expect("Failed to create Raft");
+                    // Create Raft instance
+                    let raft = openraft::Raft::new(
+                        node_id,
+                        raft_config,
+                        TurmoilNetwork,
+                        log_store,
+                        state_machine,
+                    )
+                    .await
+                    .expect("Failed to create Raft");
 
-                let raft = Arc::new(raft);
+                    let raft = Arc::new(raft);
 
-                // Register this node's state for external observation
-                {
-                    let mut state = cluster_state.lock().unwrap();
-                    state.rafts.insert(node_id, raft.clone());
-                    state.log_stores.insert(node_id, log_store.clone());
-                    state.state_machines.insert(node_id, state_machine.clone());
-                }
+                    // Register/Update this node's Raft instance for external observation
+                    {
+                        let mut state = cluster_state.lock().unwrap();
+                        state.rafts.insert(node_id, raft.clone());
+                    }
 
-                // Initialize cluster on node 1 after a short delay to let other nodes start
-                if node_id == 1 {
-                    // Give other nodes time to start their listeners
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    tracing::info!("Initializing cluster on node {}", node_id);
-                    raft.initialize(all_nodes.clone())
-                        .await
-                        .expect("Failed to initialize");
-                }
+                    // Initialize cluster on node 1 if it's the first time starting
+                    if node_id == 1 {
+                        // Check if already initialized by looking at log
+                        let is_initialized = {
+                            use openraft::storage::RaftLogStorage;
+                            let mut state = cluster_state.lock().unwrap();
+                            let log_store = state.log_stores.get_mut(&node_id).unwrap();
+                            log_store.get_log_state().await.unwrap().last_log_id.is_some()
+                        };
 
-                // Handle incoming connections
-                loop {
-                    match listener.accept().await {
-                        Ok((stream, _addr)) => {
-                            let raft_clone = raft.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = handle_rpc(raft_clone, stream).await {
-                                    tracing::warn!("RPC handler error: {}", e);
-                                }
-                            });
-                        }
-                        Err(e) => {
-                            tracing::error!("Accept error: {}", e);
+                        if !is_initialized {
+                            // Give other nodes time to start their listeners
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            tracing::info!("Initializing cluster on node {}", node_id);
+                            raft.initialize(all_nodes.clone())
+                                .await
+                                .expect("Failed to initialize");
                         }
                     }
-                }
-            })
+
+                    // Handle incoming connections
+                    loop {
+                        match listener.accept().await {
+                            Ok((stream, _addr)) => {
+                                let raft_clone = raft.clone();
+                                tokio::spawn(async move {
+                                    if let Err(e) = handle_rpc(raft_clone, stream).await {
+                                        tracing::warn!("RPC handler error: {}", e);
+                                    }
+                                });
+                            }
+                            Err(e) => {
+                                tracing::error!("Accept error: {}", e);
+                            }
+                        }
+                    }
+                }).await;
+                res
+            }
         });
     }
 
     (ClusterInfo { node_ids, nodes }, cluster_state)
+}
+
+/// Restart a node by bouncing it.
+pub fn restart_node(
+    sim: &mut Sim,
+    node_id: NodeId,
+) {
+    let host_name = ClusterInfo::host_name(node_id);
+    tracing::info!("RESTART: bouncing {}", host_name);
+    sim.bounce(host_name);
 }
