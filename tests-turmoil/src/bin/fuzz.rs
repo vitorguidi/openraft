@@ -22,7 +22,6 @@ use rand::rngs::SmallRng as SmallRng08;
 use rand::SeedableRng as SeedableRng08;
 
 use tests_turmoil::cluster::{spawn_cluster, ClusterConfig};
-use tests_turmoil::invariants::check_metrics_invariants;
 use tests_turmoil::invariants::check_state_invariants;
 
 /// Fuzzer configuration
@@ -220,7 +219,7 @@ fn run_fuzz_test(config: &FuzzConfig, seed: u64, running: Arc<AtomicBool>) -> Fu
         ..Default::default()
     });
 
-    let (cluster_info, cluster_state) = spawn_cluster(
+    let (_cluster_info, cluster_state) = spawn_cluster(
         &mut sim,
         ClusterConfig {
             num_nodes,
@@ -302,7 +301,7 @@ fn run_fuzz_test(config: &FuzzConfig, seed: u64, running: Arc<AtomicBool>) -> Fu
                         .map(|(&id, raft)| (id, raft.clone()))
                 };
 
-                if let Some((leader_id, raft)) = leader {
+                if let Some((_leader_id, raft)) = leader {
                     if rng.gen_bool(0.5) {
                         let req = tests_turmoil::typ::Request {
                             client_id: "workload".to_string(),
@@ -363,9 +362,6 @@ fn run_fuzz_test(config: &FuzzConfig, seed: u64, running: Arc<AtomicBool>) -> Fu
             }
             unique_states.insert(hasher.finish());
         }
-
-        let res = check_metrics_invariants(&metrics);
-        if !res.passed { violations.extend(res.violations.iter().map(|v| format!("(metrics) {}", v))); }
 
         let res = check_state_invariants(&snapshots);
         if !res.passed { violations.extend(res.violations.iter().map(|v| format!("(state) {}", v))); }

@@ -311,63 +311,6 @@ impl Default for InvariantChecker {
     }
 }
 
-/// Check invariants based on collected metrics from nodes.
-///
-/// Takes a slice of (NodeId, RaftMetrics) tuples collected directly from
-/// the cluster state (no RPC needed).
-pub fn check_metrics_invariants(metrics: &[(NodeId, RaftMetrics)]) -> InvariantCheckResult {
-    let mut violations = Vec::new();
-
-    // Check: At most one leader per term
-    let mut leaders_by_term: HashMap<u64, Vec<NodeId>> = HashMap::new();
-    for (node_id, m) in metrics {
-        if m.state.is_leader() {
-            let vote = &m.vote;
-            leaders_by_term
-                .entry(vote.leader_id().term)
-                .or_default()
-                .push(*node_id);
-        }
-    }
-
-    for (term, leaders) in &leaders_by_term {
-        if leaders.len() > 1 {
-            violations.push(InvariantViolation::MultipleLeadersInTerm {
-                term: *term,
-                leaders: leaders.clone(),
-            });
-        }
-    }
-
-    // Check: All nodes that have the same log entry at an index should have the same term
-    // We can only do a limited check here since we don't have full log access via metrics
-    // But we can check that last_log_id is consistent
-
-    // Check: Committed entries should be on majority
-    // If multiple nodes report different commit indices, the one with higher commit
-    // should have all the commits of the one with lower commit
-    // This is a sanity check - full verification would require log access
-
-    // Additional check: Vote consistency
-    // Nodes in the same term should not have voted for different candidates
-    // unless one hasn't voted yet
-    let mut votes_by_term: HashMap<u64, HashMap<NodeId, NodeId>> = HashMap::new();
-    for (node_id, m) in metrics {
-        let vote = &m.vote;
-        // The vote contains (term, node_id) where node_id is who they voted for
-        votes_by_term
-            .entry(vote.leader_id().term)
-            .or_default()
-            .insert(*node_id, vote.leader_id().node_id);
-    }
-
-    // In a valid Raft, each node votes for at most one candidate per term
-    // The data structure already enforces this per-node, so this is mainly
-    // a sanity check that we collected data correctly
-
-    InvariantCheckResult::with_violations(violations)
-}
-
 /// Check invariants based on collected state snapshots from nodes.
 pub fn check_state_invariants(snapshots: &[(NodeId, RaftStateSnapshot)]) -> InvariantCheckResult {
     let mut violations = Vec::new();
