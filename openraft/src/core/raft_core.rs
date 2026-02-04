@@ -74,6 +74,7 @@ use crate::metrics::RaftMetrics;
 use crate::metrics::RaftServerMetrics;
 use crate::metrics::ReplicationMetrics;
 use crate::metrics::SerdeInstant;
+use crate::raft::RaftStateSnapshot;
 use crate::network::NetStreamAppend;
 use crate::network::NetTransferLeader;
 use crate::network::NetVote;
@@ -226,6 +227,7 @@ where
     pub(crate) tx_metrics: WatchSenderOf<C, RaftMetrics<C>>,
     pub(crate) tx_data_metrics: WatchSenderOf<C, RaftDataMetrics<C>>,
     pub(crate) tx_server_metrics: WatchSenderOf<C, RaftServerMetrics<C>>,
+    pub(crate) tx_state: WatchSenderOf<C, RaftStateSnapshot<C>>,
     pub(crate) tx_progress: IoProgressSender<C>,
 
     /// Runtime statistics for Raft operations.
@@ -783,6 +785,22 @@ where
             }
             false
         });
+
+        {
+            let snapshot = RaftStateSnapshot {
+                node_id: self.id.clone(),
+                vote: st.vote_ref().clone(),
+                log_ids: st.log_ids.clone(),
+                membership_state: st.membership_state.clone(),
+                server_state: st.server_state,
+                accepted: st.accepted_log_io().and_then(|io_id| io_id.last_log_id().cloned()),
+                applied: st.io_applied().cloned(),
+                committed: st.committed().cloned(),
+                snapshot_meta: st.snapshot_meta.clone(),
+                purged: st.last_purged_log_id().cloned(),
+            };
+            self.tx_state.send(snapshot).ok();
+        }
 
         tracing::debug!("report metrics: {}", m);
         let res = self.tx_metrics.send(m);

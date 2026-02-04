@@ -87,6 +87,11 @@ impl ClusterState {
             })
             .collect()
     }
+
+    /// Get state snapshots from all nodes.
+    pub fn get_all_state_snapshots(&self) -> Vec<(NodeId, RaftStateSnapshot)> {
+        self.rafts.iter().map(|(&id, raft)| (id, raft.state_snapshot())).collect()
+    }
 }
 
 impl Default for ClusterState {

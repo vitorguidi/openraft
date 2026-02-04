@@ -68,3 +68,4 @@ pub type InstallSnapshotRequest = openraft::raft::InstallSnapshotRequest<TypeCon
 
 pub type SnapshotData = Cursor<Vec<u8>>;
 pub type RaftMetrics = openraft::RaftMetrics<TypeConfig>;
+pub type RaftStateSnapshot = openraft::RaftStateSnapshot<TypeConfig>;

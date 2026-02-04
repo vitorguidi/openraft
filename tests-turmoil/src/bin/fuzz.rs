@@ -19,6 +19,7 @@ use rand::{Rng, SeedableRng};
 
 use tests_turmoil::cluster::{spawn_cluster, ClusterConfig};
 use tests_turmoil::invariants::check_metrics_invariants;
+use tests_turmoil::invariants::check_state_invariants;
 
 /// Fuzzer configuration
 struct FuzzConfig {
@@ -54,8 +55,8 @@ fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("openraft=off".parse().unwrap())
-                .add_directive("tests_turmoil=error".parse().unwrap()),
+                .add_directive("openraft=info".parse().unwrap())
+                .add_directive("tests_turmoil=info".parse().unwrap()),
         )
         .init();
 
@@ -239,6 +240,7 @@ fn run_fuzz_test(config: &FuzzConfig, seed: u64, running: Arc<AtomicBool>) -> Fu
                         // Partition a random node
                         let victim = rng.gen_range(1..=num_nodes);
                         let victim_name = format!("node-{}", victim);
+                        tracing::info!("CHAOS: partitioning {}", victim_name);
                         for i in 1..=num_nodes {
                             if i != victim {
                                 let other = format!("node-{}", i);
@@ -248,6 +250,7 @@ fn run_fuzz_test(config: &FuzzConfig, seed: u64, running: Arc<AtomicBool>) -> Fu
                     }
                     1 => {
                         // Repair all partitions
+                        tracing::info!("CHAOS: repairing all partitions");
                         for i in 1..=num_nodes {
                             for j in (i + 1)..=num_nodes {
                                 let a = format!("node-{}", i);
@@ -263,10 +266,12 @@ fn run_fuzz_test(config: &FuzzConfig, seed: u64, running: Arc<AtomicBool>) -> Fu
                         while b == a {
                             b = rng.gen_range(1..=num_nodes);
                         }
+                        tracing::info!("CHAOS: holding messages between node-{} and node-{}", a, b);
                         turmoil::hold(format!("node-{}", a), format!("node-{}", b));
                     }
                     3 => {
                         // Release all holds
+                        tracing::info!("CHAOS: releasing all message holds");
                         for i in 1..=num_nodes {
                             for j in 1..=num_nodes {
                                 if i != j {
@@ -312,19 +317,25 @@ fn run_fuzz_test(config: &FuzzConfig, seed: u64, running: Arc<AtomicBool>) -> Fu
                         .map(|(&id, raft)| (id, raft.clone()))
                 };
 
-                if let Some((_leader_id, raft)) = leader {
+                if let Some((leader_id, raft)) = leader {
                     let key = format!("key-{}", write_count % 100);
                     let value = format!("value-{}-{}", write_count, rng.r#gen::<u32>());
 
                     let req = tests_turmoil::typ::Request {
                         client_id: "workload".to_string(),
                         serial: write_count,
-                        key,
-                        value,
+                        key: key.clone(),
+                        value: value.clone(),
                     };
+                    tracing::info!("WORKLOAD: writing {}={} to leader {}", key, value, leader_id);
                     if raft.client_write(req).await.is_ok() {
+                        tracing::info!("WORKLOAD: write {} successful", write_count);
                         write_count += 1;
+                    } else {
+                        tracing::warn!("WORKLOAD: write {} failed", write_count);
                     }
+                } else {
+                    tracing::info!("WORKLOAD: no leader found");
                 }
             }
 
@@ -371,23 +382,35 @@ fn run_fuzz_test(config: &FuzzConfig, seed: u64, running: Arc<AtomicBool>) -> Fu
         }
 
         // ========== CHECK INVARIANTS (after every step) ==========
-        let metrics = {
+        let (metrics, snapshots) = {
             let state = cluster_state.lock().unwrap();
-            state.get_all_metrics()
+            (state.get_all_metrics(), state.get_all_state_snapshots())
         };
         invariant_checks += 1;
+
+        // Check metrics invariants
         let result = check_metrics_invariants(&metrics);
         if !result.passed {
             for v in &result.violations {
-                let msg = format!("Step {}: {}", steps, v);
+                let msg = format!("Step {}: (metrics) {}", steps, v);
+                println!("VIOLATION: {}", msg);
+                violations.push(msg);
+            }
+        }
+
+        // Check internal state invariants
+        let result = check_state_invariants(&snapshots);
+        if !result.passed {
+            for v in &result.violations {
+                let msg = format!("Step {}: (state) {}", steps, v);
                 println!("VIOLATION: {}", msg);
                 violations.push(msg);
             }
         }
         // ===========================================================
 
-        // Progress report every 10000 steps
-        if steps % 10000 == 0 {
+        // Progress report every 1000 steps
+        if steps % 1000 == 0 {
             let leaders: Vec<_> = metrics
                 .iter()
                 .filter(|(_, m)| m.state.is_leader())

@@ -360,6 +360,65 @@ pub fn check_metrics_invariants(metrics: &[(NodeId, RaftMetrics)]) -> InvariantC
     InvariantCheckResult::with_violations(violations)
 }
 
+/// Check invariants based on collected state snapshots from nodes.
+pub fn check_state_invariants(snapshots: &[(NodeId, RaftStateSnapshot)]) -> InvariantCheckResult {
+    let mut violations = Vec::new();
+
+    // Check: At most one leader per term
+    let mut leaders_by_term: HashMap<u64, Vec<NodeId>> = HashMap::new();
+    for (node_id, s) in snapshots {
+        if s.server_state == openraft::ServerState::Leader {
+            leaders_by_term.entry(s.vote.leader_id().term).or_default().push(*node_id);
+        }
+    }
+
+    for (term, leaders) in &leaders_by_term {
+        if leaders.len() > 1 {
+            violations.push(InvariantViolation::MultipleLeadersInTerm {
+                term: *term,
+                leaders: leaders.clone(),
+            });
+        }
+    }
+
+    // Check: Log consistency
+    for i in 0..snapshots.len() {
+        for j in (i + 1)..snapshots.len() {
+            let (id_a, s_a) = &snapshots[i];
+            let (id_b, s_b) = &snapshots[j];
+
+            // For every index present in both log_id_lists, the term must be the same
+            let last_a = s_a.log_ids.last().map(|id: &LogId| id.index()).unwrap_or(0);
+            let last_b = s_b.log_ids.last().map(|id: &LogId| id.index()).unwrap_or(0);
+
+            let first_a = s_a.log_ids.purged().map(|id: &LogId| id.index()).unwrap_or(0);
+            let first_b = s_b.log_ids.purged().map(|id: &LogId| id.index()).unwrap_or(0);
+
+            let start = std::cmp::max(first_a, first_b);
+            let end = std::cmp::min(last_a, last_b);
+
+            for idx in start..=end {
+                let term_a = s_a.log_ids.get(idx).map(|id: LogId| id.committed_leader_id().term);
+                let term_b = s_b.log_ids.get(idx).map(|id: LogId| id.committed_leader_id().term);
+
+                if let (Some(ta), Some(tb)) = (term_a, term_b) {
+                    if ta != tb {
+                        violations.push(InvariantViolation::LogMismatch {
+                            index: idx,
+                            node_a: *id_a,
+                            node_b: *id_b,
+                            term_a: ta,
+                            term_b: tb,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    InvariantCheckResult::with_violations(violations)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
