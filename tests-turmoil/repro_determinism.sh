@@ -2,8 +2,8 @@
 set -e
 
 # Configuration
-STEPS=1000
-RUNS=10
+STEPS=10000
+RUNS=5
 SEED=12345
 LOG_DIR="repro_logs"
 
@@ -19,24 +19,23 @@ rm -f "$LOG_DIR"/*.sim
 for i in $(seq 1 $RUNS); do
     echo -n "Run $i/$RUNS... "
     
-    # Run the fuzzer (using local cargo if available, otherwise docker)
-    if command -v cargo >/dev/null 2>&1; then
-        RUST_LOG=info cargo run --bin fuzz -- --iterations 1 --steps "$STEPS" --seed "$SEED" > "$LOG_DIR/run_$i.log" 2>&1
-    else
-        docker run --rm -v "$(pwd)/..:/app" -w /app/tests-turmoil rust:1.92-bookworm /bin/bash -c "RUST_LOG=info cargo run --bin fuzz -- --iterations 1 --steps $STEPS --seed $SEED" > "$LOG_DIR/run_$i.log" 2>&1
-    fi
+    # Run the fuzzer using docker
+    docker run --rm -v "$(pwd)/..:/app" -w /app/tests-turmoil rust:1.92-bookworm /bin/bash -c "RUST_LOG=info cargo run --bin fuzz -- --iterations 1 --steps $STEPS --seed $SEED" > "$LOG_DIR/run_$i.log" 2>&1
     
     # Normalize the logs
-    # 1. Extract simulation lines
-    # 2. Mask embedded durations and clock-based metadata
-    # 3. Mask HH:MM:SS.ffffff timestamps
-    sed -n '/Starting simulation/,$p' "$LOG_DIR/run_$i.log" | 
-    sed -E 's/tv_sec: [0-9]+, tv_nsec: [0-9]+/tv_sec: MASKED, tv_nsec: MASKED/g' | 
-    sed -E 's/[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}/HH:MM:SS.ffffff/g' | 
-    sed -E 's/@[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}/@HH:MM:SS.ffffff/g' | 
-    sed -E 's/[0-9]+ms ago/Xms ago/g' | 
+    # Extract from 'Iteration' to 'Final Results'
+    sed -n '/Iteration 1/,/Final Results/p' "$LOG_DIR/run_$i.log" | \
+    sed -E 's/tv_sec: [0-9]+, tv_nsec: [0-9]+/tv_sec: MASKED, tv_nsec: MASKED/g' | \
+    sed -E 's/[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}/HH:MM:SS.ffffff/g' | \
+    sed -E 's/@[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}/@HH:MM:SS.ffffff/g' | \
+    sed -E 's/[0-9]+ms ago/Xms ago/g' | \
     sed -E 's/[0-9]+\.[0-9]{3}s/X.XXXs/g' > "$LOG_DIR/run_$i.sim"
     
+    if [ ! -s "$LOG_DIR/run_$i.sim" ]; then
+        echo "ERROR: Simulation log is empty. Check $LOG_DIR/run_$i.log"
+        exit 1
+    fi
+
     echo "Hash: $(sha256sum "$LOG_DIR/run_$i.sim" | cut -d' ' -f1)"
 done
 
