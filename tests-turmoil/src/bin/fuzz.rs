@@ -9,6 +9,7 @@
 //! Run with: cargo run --bin fuzz
 //! Or with options: cargo run --bin fuzz -- --seed 12345 --fail-rate 0.1
 
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,6 +24,8 @@ use rand::SeedableRng as SeedableRng08;
 
 use tests_turmoil::cluster::{spawn_cluster, ClusterConfig};
 use tests_turmoil::invariants::check_state_invariants;
+use tests_turmoil::store::StateMachineData;
+use tests_turmoil::typ::*;
 
 /// Fuzzer configuration
 struct FuzzConfig {
@@ -147,6 +150,8 @@ fn main() {
             global_unique_states.insert(state);
         }
 
+        print_final_sm_data(&result.cluster_state);
+
         if !result.violations.is_empty() {
             // Print failure results
             println!();
@@ -184,6 +189,7 @@ struct FuzzResult {
     invariant_checks: u64,
     violations: Vec<String>,
     unique_states: HashSet<u64>,
+    cluster_state: Arc<std::sync::Mutex<tests_turmoil::cluster::ClusterState>>,
 }
 
 fn run_fuzz_test(config: &FuzzConfig, seed: u64, running: Arc<AtomicBool>) -> FuzzResult {
@@ -209,7 +215,7 @@ fn run_fuzz_test(config: &FuzzConfig, seed: u64, running: Arc<AtomicBool>) -> Fu
         .simulation_duration(Duration::from_secs(3600))
         .fail_rate(fail_rate)
         .enable_random_order()
-        .tcp_capacity(65536) // Large queue capacity to handle bursts of concurrent RPC connections
+        .tcp_capacity(65536)
         .build_with_rng(sim_rng);
 
     let raft_config = Arc::new(openraft::Config {
@@ -219,7 +225,7 @@ fn run_fuzz_test(config: &FuzzConfig, seed: u64, running: Arc<AtomicBool>) -> Fu
         ..Default::default()
     });
 
-    let (_cluster_info, cluster_state) = spawn_cluster(
+    let (cluster_info, cluster_state) = spawn_cluster(
         &mut sim,
         ClusterConfig {
             num_nodes,
@@ -285,6 +291,7 @@ fn run_fuzz_test(config: &FuzzConfig, seed: u64, running: Arc<AtomicBool>) -> Fu
         let cluster_state_clone = cluster_state.clone();
         let workload_seed = seed.wrapping_add(2000);
         sim.client("workload", async move {
+            println!("WORKLOAD: client starting");
             let mut rng = StdRng::seed_from_u64(workload_seed);
             let mut op_count = 0u64;
             loop {
@@ -325,6 +332,11 @@ fn run_fuzz_test(config: &FuzzConfig, seed: u64, running: Arc<AtomicBool>) -> Fu
     let mut violations: Vec<String> = Vec::new();
     let mut unique_states = HashSet::new();
     let mut chaos_rng = StdRng::seed_from_u64(seed.wrapping_add(3000));
+    
+    // Canonical State Machine history: Index -> StateMachineData
+    let mut sm_history: HashMap<u64, StateMachineData> = HashMap::new();
+
+    println!("Starting simulation...");
 
     loop {
         if !running.load(Ordering::Relaxed) || steps >= config.max_steps {
@@ -337,14 +349,21 @@ fn run_fuzz_test(config: &FuzzConfig, seed: u64, running: Arc<AtomicBool>) -> Fu
             tests_turmoil::cluster::restart_node(&mut sim, victim);
         }
 
-        match sim.step() {
-            Ok(_) => steps += 1,
-            Err(_) => break,
+        // Step the simulation
+        loop {
+            match sim.step() {
+                Ok(more_tasks) => { if !more_tasks { break; } }
+                Err(e) => {
+                    println!("Simulation stopped: {}", e);
+                    return FuzzResult { steps_completed: steps, invariant_checks, violations, unique_states, cluster_state: cluster_state.clone() };
+                }
+            }
         }
+        steps += 1;
 
         let (metrics, snapshots) = {
             let state = cluster_state.lock().unwrap();
-            (state.get_all_metrics(), state.get_all_state_snapshots())
+            (state.get_all_metrics(), state.get_all_full_snapshots())
         };
         invariant_checks += 1;
 
@@ -353,7 +372,7 @@ fn run_fuzz_test(config: &FuzzConfig, seed: u64, running: Arc<AtomicBool>) -> Fu
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             for (id, m) in &metrics {
                 id.hash(&mut hasher);
-                (m.state as u8).hash(&mut hasher); // Cast enum to u8 for hashing
+                (m.state as u8).hash(&mut hasher);
                 m.vote.leader_id().term.hash(&mut hasher);
                 if let Some(applied) = m.last_applied {
                     applied.index().hash(&mut hasher);
@@ -361,6 +380,22 @@ fn run_fuzz_test(config: &FuzzConfig, seed: u64, running: Arc<AtomicBool>) -> Fu
                 }
             }
             unique_states.insert(hasher.finish());
+        }
+
+        // DEEP SAFETY: Verify State Machine consistency against historical "canonical" values
+        for (id, node_snap) in &snapshots {
+            if let Some(applied_id) = node_snap.sm.last_applied {
+                let idx = applied_id.index();
+                if let Some(canonical_sm) = sm_history.get(&idx) {
+                    if &node_snap.sm.data != &canonical_sm.data {
+                        violations.push(format!("(sm) Divergence at index {}: node {} has different data than canonical state for this index", idx, id));
+                    }
+                } else {
+                    // This is a new index we haven't recorded yet.
+                    // If multiple nodes are at this index, they must agree.
+                    sm_history.insert(idx, node_snap.sm.clone());
+                }
+            }
         }
 
         let res = check_state_invariants(&snapshots);
@@ -380,5 +415,26 @@ fn run_fuzz_test(config: &FuzzConfig, seed: u64, running: Arc<AtomicBool>) -> Fu
         invariant_checks,
         violations,
         unique_states,
+        cluster_state: cluster_state.clone(),
     }
+}
+
+fn print_final_sm_data(cluster_state: &Arc<std::sync::Mutex<tests_turmoil::cluster::ClusterState>>) {
+    let state = cluster_state.lock().unwrap();
+    println!("Final State Machine Data:");
+    for (id, sm) in &state.state_machines {
+        let data = sm.get_data();
+        println!("  Node {}: applied={:?}, data_len={}", id, data.last_applied, data.data.len());
+        if !data.data.is_empty() {
+            let mut keys: Vec<_> = data.data.keys().collect();
+            keys.sort();
+            for k in keys.iter().take(5) {
+                println!("    {} => {}", k, data.data.get(*k).unwrap());
+            }
+            if keys.len() > 5 {
+                println!("    ... and {} more keys", keys.len() - 5);
+            }
+        }
+    }
+    println!();
 }

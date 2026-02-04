@@ -25,7 +25,7 @@ use serde::Serialize;
 use crate::typ::*;
 
 /// State machine data.
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StateMachineData {
     pub last_applied: Option<LogId>,
     pub last_membership: StoredMembership,

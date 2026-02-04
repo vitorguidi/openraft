@@ -15,6 +15,7 @@ use crate::network::TurmoilNetwork;
 use crate::store::new_store;
 use crate::store::LogStore;
 use crate::store::StateMachine;
+use crate::store::StateMachineData;
 use crate::typ::*;
 
 /// Information about a running cluster.
@@ -73,6 +74,12 @@ pub struct ClusterState {
     pub state_machines: BTreeMap<NodeId, Arc<StateMachine>>,
 }
 
+/// Combined snapshot of both Raft and State Machine state.
+pub struct FullNodeSnapshot {
+    pub raft: RaftStateSnapshot,
+    pub sm: StateMachineData,
+}
+
 impl ClusterState {
     pub fn new() -> Self {
         Self {
@@ -93,9 +100,16 @@ impl ClusterState {
             .collect()
     }
 
-    /// Get state snapshots from all nodes.
-    pub fn get_all_state_snapshots(&self) -> Vec<(NodeId, RaftStateSnapshot)> {
-        self.rafts.iter().map(|(&id, raft)| (id, raft.state_snapshot())).collect()
+    /// Get combined Raft and State Machine snapshots from all nodes.
+    pub fn get_all_full_snapshots(&self) -> Vec<(NodeId, FullNodeSnapshot)> {
+        self.rafts
+            .iter()
+            .map(|(&id, raft)| {
+                let sm = self.state_machines.get(&id).expect("sm not found").get_data();
+                let raft = raft.state_snapshot();
+                (id, FullNodeSnapshot { raft, sm })
+            })
+            .collect()
     }
 }
 

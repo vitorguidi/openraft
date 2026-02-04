@@ -311,15 +311,17 @@ impl Default for InvariantChecker {
     }
 }
 
+use crate::cluster::FullNodeSnapshot;
+
 /// Check invariants based on collected state snapshots from nodes.
-pub fn check_state_invariants(snapshots: &[(NodeId, RaftStateSnapshot)]) -> InvariantCheckResult {
+pub fn check_state_invariants(snapshots: &[(NodeId, FullNodeSnapshot)]) -> InvariantCheckResult {
     let mut violations = Vec::new();
 
     // Check: At most one leader per term
     let mut leaders_by_term: HashMap<u64, Vec<NodeId>> = HashMap::new();
     for (node_id, s) in snapshots {
-        if s.server_state == openraft::ServerState::Leader {
-            leaders_by_term.entry(s.vote.leader_id().term).or_default().push(*node_id);
+        if s.raft.server_state == openraft::ServerState::Leader {
+            leaders_by_term.entry(s.raft.vote.leader_id().term).or_default().push(*node_id);
         }
     }
 
@@ -332,25 +334,25 @@ pub fn check_state_invariants(snapshots: &[(NodeId, RaftStateSnapshot)]) -> Inva
         }
     }
 
-    // Check: Log consistency
+    // Check: Log consistency and State Machine Safety
     for i in 0..snapshots.len() {
         for j in (i + 1)..snapshots.len() {
             let (id_a, s_a) = &snapshots[i];
             let (id_b, s_b) = &snapshots[j];
 
-            // For every index present in both log_id_lists AND committed in both nodes, the term must be the same
-            let last_a = s_a.committed.map(|id: LogId| id.index()).unwrap_or(0);
-            let last_b = s_b.committed.map(|id: LogId| id.index()).unwrap_or(0);
+            // 1. Log consistency (only for committed entries)
+            let last_a = s_a.raft.committed.map(|id: LogId| id.index()).unwrap_or(0);
+            let last_b = s_b.raft.committed.map(|id: LogId| id.index()).unwrap_or(0);
 
-            let first_a = s_a.log_ids.purged().map(|id: &LogId| id.index()).unwrap_or(0);
-            let first_b = s_b.log_ids.purged().map(|id: &LogId| id.index()).unwrap_or(0);
+            let first_a = s_a.raft.log_ids.purged().map(|id: &LogId| id.index()).unwrap_or(0);
+            let first_b = s_b.raft.log_ids.purged().map(|id: &LogId| id.index()).unwrap_or(0);
 
             let start = std::cmp::max(first_a, first_b);
             let end = std::cmp::min(last_a, last_b);
 
             for idx in start..=end {
-                let term_a = s_a.log_ids.get(idx).map(|id: LogId| id.committed_leader_id().term);
-                let term_b = s_b.log_ids.get(idx).map(|id: LogId| id.committed_leader_id().term);
+                let term_a = s_a.raft.log_ids.get(idx).map(|id: LogId| id.committed_leader_id().term);
+                let term_b = s_b.raft.log_ids.get(idx).map(|id: LogId| id.committed_leader_id().term);
 
                 if let (Some(ta), Some(tb)) = (term_a, term_b) {
                     if ta != tb {
@@ -360,6 +362,19 @@ pub fn check_state_invariants(snapshots: &[(NodeId, RaftStateSnapshot)]) -> Inva
                             node_b: *id_b,
                             term_a: ta,
                             term_b: tb,
+                        });
+                    }
+                }
+            }
+
+            // 2. State Machine Safety
+            // If both nodes have applied up to the same index, their state machines must match exactly.
+            if let (Some(applied_a), Some(applied_b)) = (s_a.sm.last_applied, s_b.sm.last_applied) {
+                if applied_a == applied_b {
+                    if s_a.sm.data != s_b.sm.data {
+                        violations.push(InvariantViolation::StateMachineDivergence {
+                            index: applied_a.index() as u64,
+                            nodes: vec![*id_a, *id_b],
                         });
                     }
                 }
