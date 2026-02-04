@@ -28,39 +28,14 @@ pub struct ClusterInfo {
 }
 
 impl ClusterInfo {
-    /// Get the address for a node.
-    pub fn addr(&self, id: NodeId) -> &str {
-        &self.nodes.get(&id).expect("node not found").addr
-    }
-
     /// Get the host name for a node.
     pub fn host_name(id: NodeId) -> String {
         format!("node-{}", id)
     }
-}
 
-/// Configuration for spawning a cluster.
-pub struct ClusterConfig {
-    /// Number of nodes.
-    pub num_nodes: usize,
-    /// Raft configuration.
-    pub raft_config: Config,
-    /// Seed for deterministic RNG.
-    pub seed: u64,
-}
-
-impl Default for ClusterConfig {
-    fn default() -> Self {
-        Self {
-            num_nodes: 3,
-            raft_config: Config {
-                heartbeat_interval: 100,
-                election_timeout_min: 300,
-                election_timeout_max: 500,
-                ..Default::default()
-            },
-            seed: 0,
-        }
+    /// Get the address for a node.
+    pub fn addr(&self, id: NodeId) -> &str {
+        &self.nodes.get(&id).expect("node not found").addr
     }
 }
 
@@ -120,19 +95,113 @@ impl Default for ClusterState {
 }
 
 /// Register a node's storage in the shared state BEFORE starting it.
-pub fn register_node(
+pub fn register_node_storage(
     node_id: NodeId,
     cluster_state: &Arc<std::sync::Mutex<ClusterState>>,
 ) {
     let mut state = cluster_state.lock().unwrap();
-    let (log_store, state_machine) = new_store();
-    state.log_stores.insert(node_id, log_store);
-    state.state_machines.insert(node_id, state_machine);
+    if !state.log_stores.contains_key(&node_id) {
+        let (log_store, state_machine) = new_store();
+        state.log_stores.insert(node_id, log_store);
+        state.state_machines.insert(node_id, state_machine);
+    }
+}
+
+/// Create a Turmoil host for a node.
+pub fn spawn_host(
+    sim: &mut Sim,
+    node_id: NodeId,
+    raft_config: Arc<openraft::Config>,
+    cluster_state: Arc<std::sync::Mutex<ClusterState>>,
+    seed: u64,
+    all_nodes: BTreeMap<NodeId, Node>,
+) {
+    let host_name = ClusterInfo::host_name(node_id);
+    sim.host(host_name, move || {
+        let raft_config = raft_config.clone();
+        let all_nodes = all_nodes.clone();
+        let cluster_state = cluster_state.clone();
+        let node_seed = seed.wrapping_add(node_id);
+
+        async move {
+            let rng = RefCell::new(SmallRng::seed_from_u64(node_seed));
+
+            let res: Result<(), Box<dyn std::error::Error>> = DETERMINISTIC_RNG.scope(rng, async move {
+                let listener = TcpListener::bind("0.0.0.0:9000").await.expect("Failed to bind");
+                tracing::info!(node_id, "RPC server listening");
+
+                let (log_store, state_machine) = {
+                    let state = cluster_state.lock().unwrap();
+                    (
+                        state.log_stores.get(&node_id).expect("node not registered").clone(),
+                        state.state_machines.get(&node_id).expect("node not registered").clone(),
+                    )
+                };
+
+                let raft = openraft::Raft::new(
+                    node_id,
+                    raft_config,
+                    TurmoilNetwork,
+                    log_store,
+                    state_machine,
+                )
+                .await
+                .expect("Failed to create Raft");
+
+                let raft = Arc::new(raft);
+
+                {
+                    let mut state = cluster_state.lock().unwrap();
+                    state.rafts.insert(node_id, raft.clone());
+                }
+
+                // Node 1 initializes if needed
+                if node_id == 1 {
+                    use openraft::storage::RaftLogStorage;
+                    let is_initialized = {
+                        let mut state = cluster_state.lock().unwrap();
+                        let log_store = state.log_stores.get_mut(&node_id).unwrap();
+                        log_store.get_log_state().await.unwrap().last_log_id.is_some()
+                    };
+
+                    if !is_initialized {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        tracing::info!("Initializing cluster on node {}", node_id);
+                        raft.initialize(all_nodes.clone())
+                            .await
+                            .expect("Failed to initialize");
+                    }
+                }
+
+                loop {
+                    match listener.accept().await {
+                        Ok((stream, _addr)) => {
+                            let raft_clone = raft.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = handle_rpc(raft_clone, stream).await {
+                                    tracing::warn!("RPC handler error: {}", e);
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            tracing::error!("Accept error: {}", e);
+                        }
+                    }
+                }
+            }).await;
+            res
+        }
+    });
+}
+
+/// Configuration for spawning a cluster.
+pub struct ClusterConfig {
+    pub num_nodes: usize,
+    pub raft_config: Config,
+    pub seed: u64,
 }
 
 /// Spawn a cluster of Raft nodes in the turmoil simulation.
-///
-/// Returns cluster info and a shared state for observing nodes.
 pub fn spawn_cluster(
     sim: &mut Sim,
     config: ClusterConfig,
@@ -140,110 +209,16 @@ pub fn spawn_cluster(
     let node_ids: Vec<NodeId> = (1..=config.num_nodes as u64).collect();
     let mut nodes = BTreeMap::new();
 
-    // Build node addresses
     for &id in &node_ids {
-        let addr = format!("{}:9000", ClusterInfo::host_name(id));
-        nodes.insert(id, Node { addr });
+        nodes.insert(id, Node { addr: format!("{}:9000", ClusterInfo::host_name(id)) });
     }
 
     let raft_config = Arc::new(config.raft_config);
     let cluster_state = Arc::new(std::sync::Mutex::new(ClusterState::new()));
 
-    // Register all nodes first (to initialize persistent storage)
     for &node_id in &node_ids {
-        register_node(node_id, &cluster_state);
-    }
-
-    // Spawn each node host
-    for &node_id in &node_ids {
-        let raft_config = raft_config.clone();
-        let all_nodes = nodes.clone();
-        let cluster_state = cluster_state.clone();
-        let host_name = ClusterInfo::host_name(node_id);
-        let seed = config.seed;
-
-        sim.host(host_name, move || {
-            let raft_config = raft_config.clone();
-            let all_nodes = all_nodes.clone();
-            let cluster_state = cluster_state.clone();
-            let node_seed = seed.wrapping_add(node_id);
-
-            async move {
-                let rng = RefCell::new(SmallRng::seed_from_u64(node_seed));
-
-                let res: Result<(), Box<dyn std::error::Error>> = DETERMINISTIC_RNG.scope(rng, async move {
-                    // Start RPC server FIRST so other nodes can connect
-                    let listener = TcpListener::bind("0.0.0.0:9000").await.expect("Failed to bind");
-                    tracing::info!(node_id, "RPC server listening");
-
-                    // Get existing storage from shared state
-                    let (log_store, state_machine) = {
-                        let state = cluster_state.lock().unwrap();
-                        (
-                            state.log_stores.get(&node_id).expect("node not registered").clone(),
-                            state.state_machines.get(&node_id).expect("node not registered").clone(),
-                        )
-                    };
-
-                    // Create Raft instance
-                    let raft = openraft::Raft::new(
-                        node_id,
-                        raft_config,
-                        TurmoilNetwork,
-                        log_store,
-                        state_machine,
-                    )
-                    .await
-                    .expect("Failed to create Raft");
-
-                    let raft = Arc::new(raft);
-
-                    // Register/Update this node's Raft instance for external observation
-                    {
-                        let mut state = cluster_state.lock().unwrap();
-                        state.rafts.insert(node_id, raft.clone());
-                    }
-
-                    // Initialize cluster on node 1 if it's the first time starting
-                    if node_id == 1 {
-                        // Check if already initialized by looking at log
-                        let is_initialized = {
-                            use openraft::storage::RaftLogStorage;
-                            let mut state = cluster_state.lock().unwrap();
-                            let log_store = state.log_stores.get_mut(&node_id).unwrap();
-                            log_store.get_log_state().await.unwrap().last_log_id.is_some()
-                        };
-
-                        if !is_initialized {
-                            // Give other nodes time to start their listeners
-                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                            tracing::info!("Initializing cluster on node {}", node_id);
-                            raft.initialize(all_nodes.clone())
-                                .await
-                                .expect("Failed to initialize");
-                        }
-                    }
-
-                    // Handle incoming connections
-                    loop {
-                        match listener.accept().await {
-                            Ok((stream, _addr)) => {
-                                let raft_clone = raft.clone();
-                                tokio::spawn(async move {
-                                    if let Err(e) = handle_rpc(raft_clone, stream).await {
-                                        tracing::warn!("RPC handler error: {}", e);
-                                    }
-                                });
-                            }
-                            Err(e) => {
-                                tracing::error!("Accept error: {}", e);
-                            }
-                        }
-                    }
-                }).await;
-                res
-            }
-        });
+        register_node_storage(node_id, &cluster_state);
+        spawn_host(sim, node_id, raft_config.clone(), cluster_state.clone(), config.seed, nodes.clone());
     }
 
     (ClusterInfo { node_ids, nodes }, cluster_state)

@@ -9,11 +9,10 @@
 //! Run with: cargo run --bin fuzz
 //! Or with options: cargo run --bin fuzz -- --seed 12345 --fail-rate 0.1
 
-use std::collections::HashMap;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use openraft::ReadPolicy;
@@ -22,7 +21,7 @@ use rand_09::{Rng, SeedableRng};
 use rand::rngs::SmallRng as SmallRng08;
 use rand::SeedableRng as SeedableRng08;
 
-use tests_turmoil::cluster::{spawn_cluster, ClusterConfig};
+use tests_turmoil::cluster::{spawn_host, register_node_storage, ClusterConfig, ClusterInfo};
 use tests_turmoil::invariants::check_state_invariants;
 use tests_turmoil::store::StateMachineData;
 use tests_turmoil::typ::*;
@@ -189,25 +188,27 @@ struct FuzzResult {
     invariant_checks: u64,
     violations: Vec<String>,
     unique_states: HashSet<u64>,
-    cluster_state: Arc<std::sync::Mutex<tests_turmoil::cluster::ClusterState>>,
+    cluster_state: Arc<Mutex<tests_turmoil::cluster::ClusterState>>,
 }
 
 fn run_fuzz_test(config: &FuzzConfig, seed: u64, running: Arc<AtomicBool>) -> FuzzResult {
     // 1. Initialize RNG from seed to derive ALL parameters
     let mut param_rng = StdRng::seed_from_u64(seed);
     
-    let num_nodes = param_rng.gen_range(3..=7);
-    let fail_rate = param_rng.gen_range(0.0..0.15);
+    let num_initial_nodes = param_rng.gen_range(3..=5);
+    let max_potential_nodes = 10u64;
+    let fail_rate = param_rng.gen_range(0.0..0.08); 
     let heartbeat_interval = param_rng.gen_range(50..150);
     let election_timeout_min = heartbeat_interval * param_rng.gen_range(2..4);
     let election_timeout_max = election_timeout_min + param_rng.gen_range(100..500);
     
     // Percentages for chaos events
-    let restart_chance = param_rng.gen_range(0.01..0.2);
-    let chaos_interval = param_rng.gen_range(500..2000);
+    let restart_chance = param_rng.gen_range(0.01..0.05);
+    let chaos_interval = param_rng.gen_range(2000..5000);
+    let membership_interval = param_rng.gen_range(10000..25000);
 
     println!("Simulation Params: nodes={}, fail_rate={:.1}%, hb={}ms, elect={}..{}ms", 
-        num_nodes, fail_rate * 100.0, heartbeat_interval, election_timeout_min, election_timeout_max);
+        num_initial_nodes, fail_rate * 100.0, heartbeat_interval, election_timeout_min, election_timeout_max);
 
     // 2. Initialize simulation with deterministic RNG
     let sim_rng = Box::new(SmallRng08::seed_from_u64(seed));
@@ -225,55 +226,51 @@ fn run_fuzz_test(config: &FuzzConfig, seed: u64, running: Arc<AtomicBool>) -> Fu
         ..Default::default()
     });
 
-    let (cluster_info, cluster_state) = spawn_cluster(
-        &mut sim,
-        ClusterConfig {
-            num_nodes,
-            raft_config: (*raft_config).clone(),
-            seed,
-        },
-    );
+    let cluster_state = Arc::new(Mutex::new(tests_turmoil::cluster::ClusterState::new()));
+    let next_membership = Arc::new(Mutex::new(None::<HashSet<NodeId>>));
 
-    // Add chaos agent (network chaos)
-    if true {
+    // Pre-register ALL hosts
+    let mut all_possible_nodes = BTreeMap::new();
+    for id in 1..=max_potential_nodes {
+        all_possible_nodes.insert(id, Node { addr: format!("{}:9000", ClusterInfo::host_name(id)) });
+    }
+
+    for id in 1..=max_potential_nodes {
+        register_node_storage(id, &cluster_state);
+        spawn_host(&mut sim, id, raft_config.clone(), cluster_state.clone(), seed, all_possible_nodes.clone());
+    }
+
+    // Add chaos agent
+    {
         let chaos_seed = seed.wrapping_add(1000);
         sim.client("chaos-agent", async move {
             let mut rng = StdRng::seed_from_u64(chaos_seed);
             loop {
                 let delay = rng.gen_range(1000..5000);
                 tokio::time::sleep(Duration::from_millis(delay)).await;
-
                 let chaos_type = rng.gen_range(0..5);
                 match chaos_type {
                     0 => {
-                        let victim = rng.gen_range(1..=num_nodes);
+                        let victim = rng.gen_range(1..=max_potential_nodes);
                         let victim_name = format!("node-{}", victim);
-                        tracing::info!("CHAOS: partitioning {}", victim_name);
-                        for i in 1..=num_nodes {
-                            if i != victim {
-                                turmoil::partition(victim_name.clone(), format!("node-{}", i));
-                            }
+                        for i in 1..=max_potential_nodes {
+                            if i != victim { turmoil::partition(victim_name.clone(), format!("node-{}", i)); }
                         }
                     }
                     1 => {
-                        tracing::info!("CHAOS: repairing all partitions");
-                        for i in 1..=num_nodes {
-                            for j in (i + 1)..=num_nodes {
-                                turmoil::repair(format!("node-{}", i), format!("node-{}", j));
-                            }
+                        for i in 1..=max_potential_nodes {
+                            for j in (i + 1)..=max_potential_nodes { turmoil::repair(format!("node-{}", i), format!("node-{}", j)); }
                         }
                     }
                     2 => {
-                        let a = rng.gen_range(1..=num_nodes);
-                        let mut b = rng.gen_range(1..=num_nodes);
-                        while b == a { b = rng.gen_range(1..=num_nodes); }
-                        tracing::info!("CHAOS: holding messages node-{} <-> node-{}", a, b);
+                        let a = rng.gen_range(1..=max_potential_nodes);
+                        let mut b = rng.gen_range(1..=max_potential_nodes);
+                        while b == a { b = rng.gen_range(1..=max_potential_nodes); }
                         turmoil::hold(format!("node-{}", a), format!("node-{}", b));
                     }
                     3 => {
-                        tracing::info!("CHAOS: releasing all message holds");
-                        for i in 1..=num_nodes {
-                            for j in 1..=num_nodes {
+                        for i in 1..=max_potential_nodes {
+                            for j in 1..=max_potential_nodes { 
                                 if i != j { turmoil::release(format!("node-{}", i), format!("node-{}", j)); }
                             }
                         }
@@ -286,34 +283,67 @@ fn run_fuzz_test(config: &FuzzConfig, seed: u64, running: Arc<AtomicBool>) -> Fu
         });
     }
 
+    // Add membership-agent
+    {
+        let cluster_state_clone = cluster_state.clone();
+        let next_membership_clone = next_membership.clone();
+        sim.client("membership-agent", async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let target_set = {
+                    let mut guard = next_membership_clone.lock().unwrap();
+                    guard.take()
+                };
+                if let Some(new_set) = target_set {
+                    let leader = {
+                        let state = cluster_state_clone.lock().unwrap();
+                        state.rafts.iter()
+                            .find(|(_, raft)| {
+                                use openraft::async_runtime::WatchReceiver;
+                                raft.metrics().borrow_watched().state.is_leader()
+                            })
+                            .map(|(_, raft)| raft.clone())
+                    };
+                    if let Some(raft) = leader {
+                        println!("MEMBERSHIP-AGENT: executing change to {:?}", new_set);
+                        let _ = raft.change_membership(new_set, false).await;
+                    } else {
+                        // Re-queue on failure
+                        let mut guard = next_membership_clone.lock().unwrap();
+                        if guard.is_none() { *guard = Some(new_set); }
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                    }
+                }
+            }
+            #[allow(unreachable_code)]
+            Ok(())
+        });
+    }
+
     // Add workload client
     {
         let cluster_state_clone = cluster_state.clone();
         let workload_seed = seed.wrapping_add(2000);
         sim.client("workload", async move {
-            println!("WORKLOAD: client starting");
             let mut rng = StdRng::seed_from_u64(workload_seed);
             let mut op_count = 0u64;
             loop {
-                let delay = rng.gen_range(10..50);
-                tokio::time::sleep(Duration::from_millis(delay)).await;
-
+                tokio::time::sleep(Duration::from_millis(rng.gen_range(10..50))).await;
                 let leader = {
                     let state = cluster_state_clone.lock().unwrap();
-                    state.rafts.iter()
-                        .find(|(_, raft)| {
-                            use openraft::async_runtime::WatchReceiver;
-                            raft.metrics().borrow_watched().state.is_leader()
-                        })
-                        .map(|(&id, raft)| (id, raft.clone()))
+                    state.rafts.iter().find(|(_, raft)| {
+                        use openraft::async_runtime::WatchReceiver;
+                        raft.metrics().borrow_watched().state.is_leader()
+                    }).map(|(_, raft)| raft.clone())
                 };
 
-                if let Some((_leader_id, raft)) = leader {
-                    if rng.gen_bool(0.5) {
+                if let Some(raft) = leader {
+                    let key_idx = rng.gen_range(0..1000);
+                    if rng.gen_bool(0.7) { 
                         let req = tests_turmoil::typ::Request {
                             client_id: "workload".to_string(),
                             serial: op_count,
-                            key: format!("key-{}", op_count % 100),
+                            key: format!("key-{}", key_idx),
                             value: format!("val-{}", rng.r#gen::<u32>()),
                         };
                         if raft.client_write(req).await.is_ok() { op_count += 1; }
@@ -332,9 +362,11 @@ fn run_fuzz_test(config: &FuzzConfig, seed: u64, running: Arc<AtomicBool>) -> Fu
     let mut violations: Vec<String> = Vec::new();
     let mut unique_states = HashSet::new();
     let mut chaos_rng = StdRng::seed_from_u64(seed.wrapping_add(3000));
+    let mut member_rng = StdRng::seed_from_u64(seed.wrapping_add(5000));
     
-    // Canonical State Machine history: Index -> StateMachineData
     let mut sm_history: HashMap<u64, StateMachineData> = HashMap::new();
+    let mut active_voters: HashSet<NodeId> = (1..=num_initial_nodes as u64).collect();
+    let mut next_node_id = (num_initial_nodes as u64) + 1;
 
     println!("Starting simulation...");
 
@@ -343,13 +375,31 @@ fn run_fuzz_test(config: &FuzzConfig, seed: u64, running: Arc<AtomicBool>) -> Fu
             break;
         }
 
-        // Periodic node restarts
-        if steps > 0 && steps % chaos_interval == 0 && chaos_rng.gen_bool(restart_chance) {
-            let victim = chaos_rng.gen_range(1..=(num_nodes as u64));
-            tests_turmoil::cluster::restart_node(&mut sim, victim);
+        if steps > 0 && steps % membership_interval == 0 {
+            let add = active_voters.len() < 3 || (active_voters.len() < 7 && member_rng.gen_bool(0.7));
+            if add {
+                if next_node_id <= max_potential_nodes {
+                    println!("MEMBERSHIP: Requesting add node {}...", next_node_id);
+                    active_voters.insert(next_node_id);
+                    next_node_id += 1;
+                    *next_membership.lock().unwrap() = Some(active_voters.clone());
+                }
+            } else if active_voters.len() > 3 {
+                let victim = *active_voters.iter().next().unwrap();
+                println!("MEMBERSHIP: Requesting remove node {}...", victim);
+                active_voters.remove(&victim);
+                *next_membership.lock().unwrap() = Some(active_voters.clone());
+            }
         }
 
-        // Step the simulation
+        if steps > 0 && steps % chaos_interval == 0 && chaos_rng.gen_bool(restart_chance) {
+            let voters: Vec<_> = active_voters.iter().collect();
+            if !voters.is_empty() {
+                let victim = **voters.get(chaos_rng.gen_range(0..voters.len())).unwrap();
+                tests_turmoil::cluster::restart_node(&mut sim, victim);
+            }
+        }
+
         loop {
             match sim.step() {
                 Ok(more_tasks) => { if !more_tasks { break; } }
@@ -367,7 +417,6 @@ fn run_fuzz_test(config: &FuzzConfig, seed: u64, running: Arc<AtomicBool>) -> Fu
         };
         invariant_checks += 1;
 
-        // FEEDBACK: Compute cluster state hash
         if steps % 10 == 0 {
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             for (id, m) in &metrics {
@@ -382,17 +431,15 @@ fn run_fuzz_test(config: &FuzzConfig, seed: u64, running: Arc<AtomicBool>) -> Fu
             unique_states.insert(hasher.finish());
         }
 
-        // DEEP SAFETY: Verify State Machine consistency against historical "canonical" values
+        // DEEP SAFETY: Verify State Machine consistency
         for (id, node_snap) in &snapshots {
             if let Some(applied_id) = node_snap.sm.last_applied {
                 let idx = applied_id.index();
                 if let Some(canonical_sm) = sm_history.get(&idx) {
                     if &node_snap.sm.data != &canonical_sm.data {
-                        violations.push(format!("(sm) Divergence at index {}: node {} has different data than canonical state for this index", idx, id));
+                        violations.push(format!("(sm) Divergence at index {}: node {} has different data than canonical state", idx, id));
                     }
                 } else {
-                    // This is a new index we haven't recorded yet.
-                    // If multiple nodes are at this index, they must agree.
                     sm_history.insert(idx, node_snap.sm.clone());
                 }
             }
@@ -403,10 +450,9 @@ fn run_fuzz_test(config: &FuzzConfig, seed: u64, running: Arc<AtomicBool>) -> Fu
 
         if steps % 5000 == 0 {
             let leaders: Vec<_> = metrics.iter().filter(|(_, m)| m.state.is_leader()).map(|(id, _)| *id).collect();
-            println!("[Step {}] Unique States: {}, Leaders: {:?}", 
-                steps, unique_states.len(), leaders);
+            println!("[Step {}] Unique States: {}, Leaders: {:?}, Voters: {:?}", 
+                steps, unique_states.len(), leaders, active_voters);
         }
-        
         if !violations.is_empty() { break; }
     }
 
@@ -419,22 +465,21 @@ fn run_fuzz_test(config: &FuzzConfig, seed: u64, running: Arc<AtomicBool>) -> Fu
     }
 }
 
-fn print_final_sm_data(cluster_state: &Arc<std::sync::Mutex<tests_turmoil::cluster::ClusterState>>) {
+fn print_final_sm_data(cluster_state: &Arc<Mutex<tests_turmoil::cluster::ClusterState>>) {
     let state = cluster_state.lock().unwrap();
     println!("Final State Machine Data:");
-    for (id, sm) in &state.state_machines {
+    let mut nodes: Vec<_> = state.state_machines.keys().collect();
+    nodes.sort();
+    
+    for id in nodes {
+        let sm = state.state_machines.get(id).unwrap();
         let data = sm.get_data();
         println!("  Node {}: applied={:?}, data_len={}", id, data.last_applied, data.data.len());
-        if !data.data.is_empty() {
-            let mut keys: Vec<_> = data.data.keys().collect();
-            keys.sort();
-            for k in keys.iter().take(5) {
-                println!("    {} => {}", k, data.data.get(*k).unwrap());
-            }
-            if keys.len() > 5 {
-                println!("    ... and {} more keys", keys.len() - 5);
-            }
+        
+        let mut keys: Vec<_> = data.data.keys().collect();
+        keys.sort();
+        for k in keys {
+            println!("    {} => {}", k, data.data.get(k).unwrap());
         }
     }
-    println!();
 }

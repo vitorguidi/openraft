@@ -16,7 +16,7 @@ use tokio::time::sleep;
 use turmoil::net::TcpStream;
 
 use crate::cluster::ClusterInfo;
-use crate::network::{RpcType, StateQueryRequest, StateQueryResponse};
+use crate::network::RpcType;
 use crate::typ::*;
 
 /// Client request to be sent to a Raft node.
@@ -79,8 +79,9 @@ impl RandomClient {
 
             // Pick a node to try
             let node_id = self.leader_hint.unwrap_or_else(|| {
-                let idx = self.rng.r#gen::<usize>() % self.cluster.node_ids.len();
-                self.cluster.node_ids[idx]
+                let node_ids: Vec<_> = self.cluster.nodes.keys().cloned().collect();
+                let idx = self.rng.r#gen::<usize>() % node_ids.len();
+                node_ids[idx]
             });
 
             let addr = self.cluster.addr(node_id);
@@ -90,13 +91,7 @@ impl RandomClient {
                     return Ok(resp);
                 }
                 Ok(ClientWriteResponse::NotLeader { leader_id }) => {
-                    tracing::debug!(
-                        "Node {} not leader, redirecting to {:?}",
-                        node_id,
-                        leader_id
-                    );
                     self.leader_hint = leader_id;
-                    // Small delay before retry
                     sleep(Duration::from_millis(10)).await;
                 }
                 Ok(ClientWriteResponse::Error(e)) => {
@@ -104,7 +99,7 @@ impl RandomClient {
                 }
                 Err(e) => {
                     tracing::warn!("Failed to reach node {}: {}", node_id, e);
-                    self.leader_hint = None; // Clear hint and try random node
+                    self.leader_hint = None; 
                     sleep(Duration::from_millis(50)).await;
                 }
             }
@@ -120,12 +115,10 @@ impl RandomClient {
         let payload = bincode::serialize(&write_req)
             .map_err(|e| ClientError::SerializationError(e.to_string()))?;
 
-        // Write: [rpc_type: u8][len: u32][payload]
         stream.write_u8(RpcType::ClientWrite as u8).await?;
         stream.write_u32(payload.len() as u32).await?;
         stream.write_all(&payload).await?;
 
-        // Read response
         let resp_len = stream.read_u32().await?;
         let mut resp_buf = vec![0u8; resp_len as usize];
         stream.read_exact(&mut resp_buf).await?;
@@ -196,7 +189,6 @@ impl OperationHistory {
             op.end_time = Some(time);
             op.result = OperationResult::Success(resp);
 
-            // Track committed values
             self.committed_values
                 .entry(op.request.key.clone())
                 .or_default()
@@ -209,22 +201,6 @@ impl OperationHistory {
             op.end_time = Some(time);
             op.result = OperationResult::Failed(error);
         }
-    }
-
-    /// Get count of successful operations.
-    pub fn success_count(&self) -> usize {
-        self.operations
-            .iter()
-            .filter(|op| matches!(op.result, OperationResult::Success(_)))
-            .count()
-    }
-
-    /// Get count of failed operations.
-    pub fn failure_count(&self) -> usize {
-        self.operations
-            .iter()
-            .filter(|op| matches!(op.result, OperationResult::Failed(_)))
-            .count()
     }
 }
 
@@ -260,44 +236,7 @@ pub async fn run_chaos_client(
             }
         }
 
-        // Random delay between requests
         let delay = client.rng.gen_range(10..100);
         sleep(Duration::from_millis(delay)).await;
     }
-}
-
-/// Query state from a single node for invariant checking.
-pub async fn query_node_state(addr: &str) -> Result<StateQueryResponse, ClientError> {
-    let mut stream = TcpStream::connect(addr)
-        .await
-        .map_err(|e| ClientError::ConnectionFailed(e.to_string()))?;
-
-    let req = StateQueryRequest;
-    let payload = bincode::serialize(&req)
-        .map_err(|e| ClientError::SerializationError(e.to_string()))?;
-
-    // Write: [rpc_type: u8][len: u32][payload]
-    stream.write_u8(RpcType::StateQuery as u8).await?;
-    stream.write_u32(payload.len() as u32).await?;
-    stream.write_all(&payload).await?;
-
-    // Read response
-    let resp_len = stream.read_u32().await?;
-    let mut resp_buf = vec![0u8; resp_len as usize];
-    stream.read_exact(&mut resp_buf).await?;
-
-    bincode::deserialize(&resp_buf).map_err(|e| ClientError::SerializationError(e.to_string()))
-}
-
-/// Query state from all nodes in the cluster.
-pub async fn query_all_node_states(cluster: &ClusterInfo) -> Vec<(NodeId, Result<StateQueryResponse, ClientError>)> {
-    let mut results = Vec::new();
-
-    for &node_id in &cluster.node_ids {
-        let addr = cluster.addr(node_id);
-        let result = query_node_state(addr).await;
-        results.push((node_id, result));
-    }
-
-    results
 }
