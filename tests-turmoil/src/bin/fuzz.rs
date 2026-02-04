@@ -9,6 +9,8 @@
 //! Run with: cargo run --bin fuzz
 //! Or with options: cargo run --bin fuzz -- --seed 12345 --fail-rate 0.1
 
+use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,12 +31,6 @@ struct FuzzConfig {
     seed: Option<u64>,
     /// Number of iterations to run (0 = forever)
     iterations: u64,
-    /// Number of nodes in cluster
-    num_nodes: usize,
-    /// Message failure rate (0.0 to 1.0)
-    fail_rate: f64,
-    /// Enable network chaos (partitions, holds)
-    enable_chaos: bool,
     /// Maximum number of steps per iteration
     max_steps: u64,
 }
@@ -44,9 +40,6 @@ impl Default for FuzzConfig {
         Self {
             seed: None, // Random
             iterations: 0, // Forever
-            num_nodes: 5,
-            fail_rate: 0.05,
-            enable_chaos: true,
             max_steps: 100_000,
         }
     }
@@ -80,33 +73,19 @@ fn main() {
                 i += 1;
                 config.iterations = args[i].parse().expect("Invalid iterations");
             }
-            "--nodes" | "-n" => {
-                i += 1;
-                config.num_nodes = args[i].parse().expect("Invalid node count");
-            }
-            "--fail-rate" | "-f" => {
-                i += 1;
-                config.fail_rate = args[i].parse().expect("Invalid fail rate");
-            }
             "--steps" => {
                 i += 1;
                 config.max_steps = args[i].parse().expect("Invalid steps");
             }
-            "--no-chaos" => {
-                config.enable_chaos = false;
-            }
             "--help" | "-h" => {
-                println!("OpenRaft Turmoil Fuzzer (tick-based)");
+                println!("OpenRaft Turmoil Fuzzer (state-space explorer)");
                 println!();
                 println!("Usage: fuzz [OPTIONS]");
                 println!();
                 println!("Options:");
                 println!("  -s, --seed <SEED>          RNG seed for reproducibility [default: random]");
                 println!("  -i, --iterations <N>       Number of iterations (0 = forever) [default: 0]");
-                println!("  -n, --nodes <N>            Number of nodes [default: 5]");
-                println!("  -f, --fail-rate <RATE>     Message failure rate 0.0-1.0 [default: 0.05]");
                 println!("      --steps <N>            Steps per iteration [default: 100000]");
-                println!("      --no-chaos             Disable chaos injection");
                 println!("  -h, --help                 Show this help");
                 return;
             }
@@ -126,14 +105,11 @@ fn main() {
             .as_nanos() as u64
     });
 
-    println!("=== OpenRaft Turmoil Fuzzer (tick-based) ===");
+    println!("=== OpenRaft Turmoil Fuzzer (state-space explorer) ===");
     println!("Start seed: {}", start_seed);
     println!("Iterations: {} (0 = forever)", config.iterations);
-    println!("Nodes: {}", config.num_nodes);
-    println!("Fail rate: {:.1}%", config.fail_rate * 100.0);
     println!("Steps/iter: {}", config.max_steps);
-    println!("Chaos: {}", config.enable_chaos);
-    println!("============================================");
+    println!("======================================================");
     println!();
 
     // Set up Ctrl+C handler
@@ -149,6 +125,7 @@ fn main() {
     let mut iteration = 0u64;
     let mut total_steps = 0u64;
     let mut total_checks = 0u64;
+    let mut global_unique_states = HashSet::new();
 
     loop {
         if !running.load(Ordering::Relaxed) {
@@ -166,6 +143,10 @@ fn main() {
         let result = run_fuzz_test(&config, seed, running.clone());
         total_steps += result.steps_completed;
         total_checks += result.invariant_checks;
+        
+        for state in result.unique_states {
+            global_unique_states.insert(state);
+        }
 
         if !result.violations.is_empty() {
             // Print failure results
@@ -173,7 +154,8 @@ fn main() {
             println!("=== FAILED at iteration {} ===", iteration + 1);
             println!("Failing seed: {}", seed);
             println!("Steps completed: {}", result.steps_completed);
-            println!("Invariant checks: {}", result.invariant_checks);
+            println!("Unique states explored: {}", global_unique_states.len());
+            println!("Total invariant checks: {}", total_checks);
             println!();
             println!("Violations:");
             for v in &result.violations {
@@ -185,14 +167,16 @@ fn main() {
         }
 
         iteration += 1;
+        println!("Unique states discovered so far: {}", global_unique_states.len());
     }
 
     // Print success results
     println!();
-    println!("=== Results ===");
+    println!("=== Final Results ===");
     println!("Iterations completed: {}", iteration);
     println!("Total steps: {}", total_steps);
     println!("Total invariant checks: {}", total_checks);
+    println!("Unique cluster states explored: {}", global_unique_states.len());
     println!("Status: PASSED");
 }
 
@@ -200,131 +184,116 @@ struct FuzzResult {
     steps_completed: u64,
     invariant_checks: u64,
     violations: Vec<String>,
+    unique_states: HashSet<u64>,
 }
 
 fn run_fuzz_test(config: &FuzzConfig, seed: u64, running: Arc<AtomicBool>) -> FuzzResult {
-    let rng = Box::new(SmallRng08::seed_from_u64(seed));
-    let mut sim = turmoil::Builder::new()
-        .simulation_duration(Duration::from_secs(3600)) // Long duration, we control via steps
-        .fail_rate(config.fail_rate)
-        .enable_random_order()
-        .build_with_rng(rng);
+    // 1. Initialize RNG from seed to derive ALL parameters
+    let mut param_rng = StdRng::seed_from_u64(seed);
+    
+    let num_nodes = param_rng.gen_range(3..=7);
+    let fail_rate = param_rng.gen_range(0.0..0.15);
+    let heartbeat_interval = param_rng.gen_range(50..150);
+    let election_timeout_min = heartbeat_interval * param_rng.gen_range(2..4);
+    let election_timeout_max = election_timeout_min + param_rng.gen_range(100..500);
+    
+    // Percentages for chaos events
+    let restart_chance = param_rng.gen_range(0.01..0.2);
+    let chaos_interval = param_rng.gen_range(500..2000);
 
-    // Randomize Raft config based on seed
+    println!("Simulation Params: nodes={}, fail_rate={:.1}%, hb={}ms, elect={}..{}ms", 
+        num_nodes, fail_rate * 100.0, heartbeat_interval, election_timeout_min, election_timeout_max);
+
+    // 2. Initialize simulation with deterministic RNG
+    let sim_rng = Box::new(SmallRng08::seed_from_u64(seed));
+    let mut sim = turmoil::Builder::new()
+        .simulation_duration(Duration::from_secs(3600))
+        .fail_rate(fail_rate)
+        .enable_random_order()
+        .build_with_rng(sim_rng);
+
     let raft_config = Arc::new(openraft::Config {
-        heartbeat_interval: 100 + (seed % 100),
-        election_timeout_min: 500 + (seed % 200),
-        election_timeout_max: 1000 + (seed % 300),
+        heartbeat_interval,
+        election_timeout_min,
+        election_timeout_max,
         ..Default::default()
     });
 
     let (cluster_info, cluster_state) = spawn_cluster(
         &mut sim,
         ClusterConfig {
-            num_nodes: config.num_nodes,
+            num_nodes,
             raft_config: (*raft_config).clone(),
             seed,
         },
     );
 
-    // Add chaos agent if enabled (runs inside simulation)
-    if config.enable_chaos {
+    // Add chaos agent (network chaos)
+    if true {
         let chaos_seed = seed.wrapping_add(1000);
-        let num_nodes = config.num_nodes;
-        let _cluster_info = cluster_info.clone();
-        let _cluster_state = cluster_state.clone();
-        let _raft_config = raft_config.clone();
-
         sim.client("chaos-agent", async move {
             let mut rng = StdRng::seed_from_u64(chaos_seed);
-
             loop {
-                // Random delay between chaos events (longer stability windows)
                 let delay = rng.gen_range(1000..5000);
                 tokio::time::sleep(Duration::from_millis(delay)).await;
 
-                let chaos_type = rng.gen_range(0..8);
+                let chaos_type = rng.gen_range(0..5);
                 match chaos_type {
                     0 => {
-                        // Partition a random node
                         let victim = rng.gen_range(1..=num_nodes);
                         let victim_name = format!("node-{}", victim);
                         tracing::info!("CHAOS: partitioning {}", victim_name);
                         for i in 1..=num_nodes {
-                            if i != (victim as usize) {
-                                let other = format!("node-{}", i);
-                                turmoil::partition(victim_name.clone(), other);
+                            if i != victim {
+                                turmoil::partition(victim_name.clone(), format!("node-{}", i));
                             }
                         }
                     }
                     1 => {
-                        // Repair all partitions
                         tracing::info!("CHAOS: repairing all partitions");
                         for i in 1..=num_nodes {
                             for j in (i + 1)..=num_nodes {
-                                let a = format!("node-{}", i);
-                                let b = format!("node-{}", j);
-                                turmoil::repair(a, b);
+                                turmoil::repair(format!("node-{}", i), format!("node-{}", j));
                             }
                         }
                     }
                     2 => {
-                        // Hold messages between two random nodes
                         let a = rng.gen_range(1..=num_nodes);
                         let mut b = rng.gen_range(1..=num_nodes);
-                        while b == a {
-                            b = rng.gen_range(1..=num_nodes);
-                        }
-                        tracing::info!("CHAOS: holding messages between node-{} and node-{}", a, b);
+                        while b == a { b = rng.gen_range(1..=num_nodes); }
+                        tracing::info!("CHAOS: holding messages node-{} <-> node-{}", a, b);
                         turmoil::hold(format!("node-{}", a), format!("node-{}", b));
                     }
                     3 => {
-                        // Release all holds
                         tracing::info!("CHAOS: releasing all message holds");
                         for i in 1..=num_nodes {
                             for j in 1..=num_nodes {
-                                if i != j {
-                                    turmoil::release(format!("node-{}", i), format!("node-{}", j));
-                                }
+                                if i != j { turmoil::release(format!("node-{}", i), format!("node-{}", j)); }
                             }
                         }
                     }
-                    4 => {
-                        // Restart a random node
-                        let _victim = rng.gen_range(1..=(num_nodes as u64));
-                        // Handled in main loop for simplicity with Sim access
-                    }
-                    _ => {
-                        // Do nothing - let system stabilize
-                    }
+                    _ => {}
                 }
             }
-
             #[allow(unreachable_code)]
             Ok(())
         });
     }
 
-    // Add workload client (runs inside simulation)
+    // Add workload client
     {
         let cluster_state_clone = cluster_state.clone();
         let workload_seed = seed.wrapping_add(2000);
-
         sim.client("workload", async move {
             let mut rng = StdRng::seed_from_u64(workload_seed);
             let mut op_count = 0u64;
-
             loop {
-                // Use a modest delay in virtual time (10-50ms)
                 let delay = rng.gen_range(10..50);
                 tokio::time::sleep(Duration::from_millis(delay)).await;
 
-                // Find leader
                 let leader = {
                     let state = cluster_state_clone.lock().unwrap();
-                    state
-                        .rafts
-                        .iter()
+                    state.rafts.iter()
                         .find(|(_, raft)| {
                             use openraft::async_runtime::WatchReceiver;
                             raft.metrics().borrow_watched().state.is_leader()
@@ -333,147 +302,86 @@ fn run_fuzz_test(config: &FuzzConfig, seed: u64, running: Arc<AtomicBool>) -> Fu
                 };
 
                 if let Some((leader_id, raft)) = leader {
-                    let do_write = rng.gen_bool(0.5);
-
-                    if do_write {
-                        let key = format!("key-{}", op_count % 100);
-                        let value = format!("value-{}-{}", op_count, rng.r#gen::<u32>());
-
+                    if rng.gen_bool(0.5) {
                         let req = tests_turmoil::typ::Request {
                             client_id: "workload".to_string(),
                             serial: op_count,
-                            key: key.clone(),
-                            value: value.clone(),
+                            key: format!("key-{}", op_count % 100),
+                            value: format!("val-{}", rng.r#gen::<u32>()),
                         };
-                        tracing::info!("WORKLOAD: writing {}={} to leader {}", key, value, leader_id);
-                        if raft.client_write(req).await.is_ok() {
-                            tracing::info!("WORKLOAD: write {} successful", op_count);
-                            op_count += 1;
-                        } else {
-                            tracing::warn!("WORKLOAD: write {} failed", op_count);
-                        }
+                        if raft.client_write(req).await.is_ok() { op_count += 1; }
                     } else {
-                        // Linearizable read
-                        tracing::info!("WORKLOAD: reading from leader {}", leader_id);
-                        match raft.ensure_linearizable(ReadPolicy::LeaseRead).await {
-                            Ok(_) => {
-                                // Once leadership is confirmed, we can read from the state machine.
-                                // In a real app, you'd query your state machine here.
-                                // Here we just log success.
-                                tracing::info!("WORKLOAD: linearizable read successful from leader {}", leader_id);
-                                op_count += 1;
-                            }
-                            Err(e) => {
-                                tracing::warn!("WORKLOAD: linearizable read failed from leader {}: {}", leader_id, e);
-                            }
-                        }
+                        if raft.ensure_linearizable(ReadPolicy::LeaseRead).await.is_ok() { op_count += 1; }
                     }
-                } else {
-                    tracing::info!("WORKLOAD: no leader found");
                 }
             }
-
             #[allow(unreachable_code)]
             Ok(())
         });
     }
 
-    // Main loop: step simulation and check invariants
     let mut steps: u64 = 0;
     let mut invariant_checks: u64 = 0;
     let mut violations: Vec<String> = Vec::new();
+    let mut unique_states = HashSet::new();
     let mut chaos_rng = StdRng::seed_from_u64(seed.wrapping_add(3000));
-    let raft_config_arc = raft_config.clone();
-
-    println!("Starting simulation...");
 
     loop {
-        // Check if we should stop
-        if !running.load(Ordering::Relaxed) {
-            println!("Interrupted at step {}", steps);
+        if !running.load(Ordering::Relaxed) || steps >= config.max_steps {
             break;
         }
 
-        if steps >= config.max_steps {
-            println!("Reached max steps: {}", config.max_steps);
-            break;
-        }
-
-        // Randomly restart a node (external chaos)
-        if config.enable_chaos && steps > 0 && steps % 1000 == 0 && chaos_rng.gen_bool(0.1) {
-            let victim = chaos_rng.gen_range(1..=(config.num_nodes as u64));
+        // Periodic node restarts
+        if steps > 0 && steps % chaos_interval == 0 && chaos_rng.gen_bool(restart_chance) {
+            let victim = chaos_rng.gen_range(1..=(num_nodes as u64));
             tests_turmoil::cluster::restart_node(&mut sim, victim);
         }
 
-        // Step the simulation - keep stepping even when Ok(false)
-        // turmoil returns Ok(false) when tasks are waiting, but time still advances
         match sim.step() {
-            Ok(_) => {
-                steps += 1;
-            }
-            Err(e) => {
-                // Check if it's just "simulation duration exceeded" which is expected
-                let err_str = e.to_string();
-                if err_str.contains("duration") || err_str.contains("without completing") {
-                    println!("Simulation duration reached at step {}", steps);
-                } else {
-                    println!("Simulation error at step {}: {}", steps, e);
-                }
-                break;
-            }
+            Ok(_) => steps += 1,
+            Err(_) => break,
         }
 
-        // ========== CHECK INVARIANTS (after every step) ==========
         let (metrics, snapshots) = {
             let state = cluster_state.lock().unwrap();
             (state.get_all_metrics(), state.get_all_state_snapshots())
         };
         invariant_checks += 1;
 
-        // Check metrics invariants
-        let result = check_metrics_invariants(&metrics);
-        if !result.passed {
-            for v in &result.violations {
-                let msg = format!("Step {}: (metrics) {}", steps, v);
-                println!("VIOLATION: {}", msg);
-                violations.push(msg);
+        // FEEDBACK: Compute cluster state hash
+        if steps % 10 == 0 {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            for (id, m) in &metrics {
+                id.hash(&mut hasher);
+                (m.state as u8).hash(&mut hasher); // Cast enum to u8 for hashing
+                m.vote.leader_id().term.hash(&mut hasher);
+                if let Some(applied) = m.last_applied {
+                    applied.index().hash(&mut hasher);
+                    applied.committed_leader_id().term.hash(&mut hasher);
+                }
             }
+            unique_states.insert(hasher.finish());
         }
 
-        // Check internal state invariants
-        let result = check_state_invariants(&snapshots);
-        if !result.passed {
-            for v in &result.violations {
-                let msg = format!("Step {}: (state) {}", steps, v);
-                println!("VIOLATION: {}", msg);
-                violations.push(msg);
-            }
-        }
-        // ===========================================================
+        let res = check_metrics_invariants(&metrics);
+        if !res.passed { violations.extend(res.violations.iter().map(|v| format!("(metrics) {}", v))); }
 
-        // Progress report every 1000 steps
-        if steps % 1000 == 0 {
-            let leaders: Vec<_> = metrics
-                .iter()
-                .filter(|(_, m)| m.state.is_leader())
-                .map(|(id, _)| *id)
-                .collect();
-            let max_term = metrics
-                .iter()
-                .map(|(_, m)| m.vote.leader_id().term)
-                .max()
-                .unwrap_or(0);
+        let res = check_state_invariants(&snapshots);
+        if !res.passed { violations.extend(res.violations.iter().map(|v| format!("(state) {}", v))); }
 
-            println!(
-                "[Step {}] leaders={:?}, term={}, checks={}, violations={}",
-                steps, leaders, max_term, invariant_checks, violations.len()
-            );
+        if steps % 5000 == 0 {
+            let leaders: Vec<_> = metrics.iter().filter(|(_, m)| m.state.is_leader()).map(|(id, _)| *id).collect();
+            println!("[Step {}] Unique States: {}, Leaders: {:?}", 
+                steps, unique_states.len(), leaders);
         }
+        
+        if !violations.is_empty() { break; }
     }
 
     FuzzResult {
         steps_completed: steps,
         invariant_checks,
         violations,
+        unique_states,
     }
 }

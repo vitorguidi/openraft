@@ -52,6 +52,9 @@ Turmoil depends on `rand 0.8`, while the main OpenRaft project uses `rand 0.9`. 
 ### 4. Committed-State Invariants
 To avoid "False Positives" in log consistency checks, the fuzzer only validates log entries that have been **committed** by both nodes. This recognizes that uncommitted entries can naturally diverge and be overwritten during standard Raft leader transitions.
 
+### 5. Verification
+Determinism can be verified by running the simulation multiple times with the same seed. After normalizing for real-world timestamps in the logs, the execution traces should be identical.
+
 ### 6. Verifying Determinism
 You can verify that the simulation is bit-for-bit deterministic by running the reproduction script:
 
@@ -61,6 +64,36 @@ cd tests-turmoil
 ```
 
 This script runs the fuzzer 10 times with the same seed, normalizes the logs (by masking timestamps), and verifies that the resulting execution traces are identical using SHA256 hashes.
+
+## Detecting and Reproducing Violations
+
+The fuzzer is designed to provide actionable feedback when a consensus bug is found.
+
+### Exit Codes
+If an invariant violation is detected (e.g., split-brain or log divergence), the process will terminate with **Exit Code 1**. In a successful run (or when interrupted by the user), it returns **Exit Code 0**.
+
+### Failure Reports
+When a failure occurs, the fuzzer prints a structured report:
+```text
+=== FAILED at iteration 42 ===
+Failing seed: 1770183381681145371
+Steps completed: 13619
+Unique states explored: 154
+
+Violations:
+  - (state) Log mismatch at index 4: node 1 has term 1, node 5 has term 2
+
+Reproduce with: cargo run --bin fuzz -- --seed 1770183381681145371 --iterations 1
+```
+
+### Reproduction
+Consensus bugs are notoriously hard to reproduce. However, because this fuzzer is **fully deterministic**, you can recreate the exact failure scenario by using the provided seed:
+
+```bash
+cargo run --bin fuzz -- --seed <FAILING_SEED> --iterations 1
+```
+
+This will regenerate the same cluster size, the same network delays, and trigger the same node crashes at the exact same millisecond. You can then add more detailed tracing or use a debugger to inspect the system state at the moment of failure.
 
 ## Running the Fuzzer
 
@@ -83,9 +116,11 @@ docker run --rm -v "$(pwd):/app" -w /app rust:1.92-bookworm /bin/bash -c "cd tes
 ```
 
 ### Options
-* `-s, --seed <SEED>`: Provide a specific seed to reproduce a failure.
-* `-i, --iterations <N>`: Number of independent simulation runs (0 for infinite).
-* `-n, --nodes <N>`: Cluster size (default: 5).
-* `-f, --fail-rate <RATE>`: Probability of message failure (0.0 to 1.0).
-* `--steps <N>`: Maximum number of ticks per iteration.
-* `--no-chaos`: Disable network partition and hold injection.
+The state-space explorer derives environmental parameters (nodes, fail-rates, timeouts) directly from the seed to maximize coverage.
+
+| Argument | Shorthand | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `--seed` | `-s` | Random | The root seed. Determines all parameters for every iteration. |
+| `--iterations` | `-i` | `0` (Infinite) | Number of independent simulation universes to explore. `0` runs until failure. |
+| `--steps` | (none) | `100,000` | The duration (in simulated ticks/ms) of each iteration. |
+| `--help` | `-h` | (none) | Displays help menu. |
