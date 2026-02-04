@@ -210,6 +210,7 @@ fn run_fuzz_test(config: &FuzzConfig, seed: u64, running: Arc<AtomicBool>) -> Fu
         .simulation_duration(Duration::from_secs(3600))
         .fail_rate(fail_rate)
         .enable_random_order()
+        .tcp_capacity(65536) // Large queue capacity to handle bursts of concurrent RPC connections
         .build_with_rng(sim_rng);
 
     let raft_config = Arc::new(openraft::Config {

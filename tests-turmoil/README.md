@@ -52,7 +52,12 @@ Turmoil depends on `rand 0.8`, while the main OpenRaft project uses `rand 0.9`. 
 ### 4. Committed-State Invariants
 To avoid "False Positives" in log consistency checks, the fuzzer only validates log entries that have been **committed** by both nodes. This recognizes that uncommitted entries can naturally diverge and be overwritten during standard Raft leader transitions.
 
-### 5. Verification
+### 5. High-Frequency RPC Handling (Caveat)
+OpenRaft's network implementation in this fuzzer opens a new TCP connection for nearly every RPC (heartbeats, votes, append entries). In high-chaos scenarios, this can flood the simulated network faster than nodes can `accept()` them. 
+* **The Symptom:** Turmoil may panic with `server socket buffer full`.
+* **The Fix:** We have explicitly set `.tcp_capacity(65536)` in the simulation builder to provide a large enough buffer for these connection bursts.
+
+### 6. Verification
 Determinism can be verified by running the simulation multiple times with the same seed. After normalizing for real-world timestamps in the logs, the execution traces should be identical.
 
 ### 6. Verifying Determinism
