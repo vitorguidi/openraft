@@ -30,7 +30,10 @@ fn test_basic_cluster_startup() {
         .simulation_duration(Duration::from_secs(30))
         .build();
 
-    let _cluster = spawn_cluster(&mut sim, ClusterConfig::default());
+    let _cluster = spawn_cluster(&mut sim, ClusterConfig {
+        seed: 1,
+        ..Default::default()
+    });
 
     sim.client("test-client", async move {
         // Wait for cluster to stabilize and elect a leader
@@ -55,6 +58,7 @@ fn test_partition_and_heal() {
 
     let _cluster = spawn_cluster(&mut sim, ClusterConfig {
         num_nodes: 5,
+        seed: 2,
         ..Default::default()
     });
 
@@ -98,15 +102,16 @@ fn test_chaos_with_client_requests() {
         .simulation_duration(Duration::from_secs(120))
         .build();
 
-    let cluster = spawn_cluster(&mut sim, ClusterConfig {
+    let (cluster_info, _cluster_state) = spawn_cluster(&mut sim, ClusterConfig {
         num_nodes: 5,
+        seed: 3,
         ..Default::default()
     });
 
     let history = Arc::new(Mutex::new(OperationHistory::new()));
 
     sim.client("chaos-client", {
-        let cluster = cluster.clone();
+        let cluster = cluster_info.clone();
         let history = history.clone();
 
         async move {
@@ -187,13 +192,14 @@ fn test_fuzz_with_seeds() {
         // Set deterministic seed
         // Note: turmoil uses its own RNG seeding mechanism
 
-        let cluster = spawn_cluster(&mut sim, ClusterConfig {
+        let (cluster_info, _cluster_state) = spawn_cluster(&mut sim, ClusterConfig {
             num_nodes: 3,
+            seed: seed as u64,
             ..Default::default()
         });
 
         sim.client("fuzz-client", {
-            let cluster = cluster.clone();
+            let cluster = cluster_info.clone();
 
             async move {
                 sleep(Duration::from_secs(2)).await;
@@ -232,6 +238,7 @@ fn test_message_delays() {
 
     let _cluster = spawn_cluster(&mut sim, ClusterConfig {
         num_nodes: 3,
+        seed: 5,
         ..Default::default()
     });
 

@@ -1,8 +1,12 @@
+use std::cell::RefCell;
 use std::future::Future;
 use std::time::Duration;
 
 use openraft_rt::AsyncRuntime;
 use openraft_rt::OptionalSend;
+use rand::RngCore;
+use rand::SeedableRng;
+use rand::rngs::SmallRng;
 
 mod instant;
 mod mpsc;
@@ -21,6 +25,38 @@ pub use oneshot::TokioOneshotSender;
 pub use watch::TokioWatch;
 pub use watch::TokioWatchReceiver;
 pub use watch::TokioWatchSender;
+
+tokio::task_local! {
+    pub static DETERMINISTIC_RNG: RefCell<SmallRng>;
+}
+
+pub enum RngSelector {
+    Thread(rand::rngs::ThreadRng),
+    Deterministic(SmallRng),
+}
+
+impl RngCore for RngSelector {
+    fn next_u32(&mut self) -> u32 {
+        match self {
+            RngSelector::Thread(r) => r.next_u32(),
+            RngSelector::Deterministic(r) => r.next_u32(),
+        }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        match self {
+            RngSelector::Thread(r) => r.next_u64(),
+            RngSelector::Deterministic(r) => r.next_u64(),
+        }
+    }
+
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        match self {
+            RngSelector::Thread(r) => r.fill_bytes(dest),
+            RngSelector::Deterministic(r) => r.fill_bytes(dest),
+        }
+    }
+}
 
 /// `Tokio` is the default asynchronous executor.
 pub struct TokioRuntime {
@@ -42,7 +78,7 @@ impl AsyncRuntime for TokioRuntime {
     type Instant = TokioInstant;
     type TimeoutError = tokio::time::error::Elapsed;
     type Timeout<R, T: Future<Output = R> + OptionalSend> = tokio::time::Timeout<T>;
-    type ThreadLocalRng = rand::rngs::ThreadRng;
+    type ThreadLocalRng = RngSelector;
 
     #[inline]
     fn spawn<T>(future: T) -> Self::JoinHandle<T::Output>
@@ -87,7 +123,11 @@ impl AsyncRuntime for TokioRuntime {
 
     #[inline]
     fn thread_rng() -> Self::ThreadLocalRng {
-        rand::rng()
+        if let Ok(rng) = DETERMINISTIC_RNG.try_with(|r| r.borrow().clone()) {
+            RngSelector::Deterministic(rng)
+        } else {
+            RngSelector::Thread(rand::rng())
+        }
     }
 
     type Mpsc = TokioMpsc;

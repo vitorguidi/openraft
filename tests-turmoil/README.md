@@ -32,15 +32,35 @@ The `Raft` node now exposes a `state_snapshot()` method. This method returns a `
 * **Zero Async**: Accessing the snapshot is a non-blocking, synchronous operation that simply clones the latest value from the channel.
 * **Continuous Updates**: Snapshots are updated in the `report_metrics` loop of `RaftCore`, ensuring the fuzzer always sees the most recent stable state.
 
-## Invariant Checking
+## Determinism Enforcement
 
-The fuzzer verifies two layers of invariants:
+To achieve bit-for-bit reproducible simulations, the following mechanisms were implemented:
 
-1. **Metrics-based Invariants**: Basic checks like ensuring only one leader exists per term based on public metrics.
-2. **Internal State Invariants**: Deep consistency checks using the `state_snapshot` API, including:
-    * **Election Safety**: Strict verification that no two nodes believe they are leaders in the same term.
-    * **Log Matching**: Ensuring that if two nodes have a log entry at the same index, their terms (and all preceding entries) match perfectly.
-    * **State Machine Consistency**: Future checks can be added to verify that applied states across the cluster do not diverge.
+### 1. Deterministic RNG Shim
+OpenRaft normally relies on the system's global random pool for election timeouts, which is non-deterministic. We introduced a `task_local!` deterministic RNG in `openraft-rt-tokio`. 
+* Each Raft node is assigned a private, seeded `SmallRng` instance.
+* When OpenRaft core requests a random number via the `AsyncRuntime` trait, it pulls from this scoped source instead of the system's global pool.
+
+### 2. Node Seeding
+In `spawn_cluster`, every node is initialized with a deterministic seed derived from the simulation's root seed (`node_seed = root_seed + node_id`). This ensures that even across multiple nodes, the sequence of "random" election timeouts is predictable and repeatable.
+
+### 3. Library Version Alignment
+Turmoil depends on `rand 0.8`, while the main OpenRaft project uses `rand 0.9`. To prevent version clashing, `tests-turmoil` explicitly aliases these versions:
+* **`rand` (0.8)**: Used for the Turmoil simulation engine and network chaos logic.
+* **`rand_09` (0.9)**: Used for OpenRaft's internal logic and the deterministic RNG shim.
+
+### 4. Committed-State Invariants
+To avoid "False Positives" in log consistency checks, the fuzzer only validates log entries that have been **committed** by both nodes. This recognizes that uncommitted entries can naturally diverge and be overwritten during standard Raft leader transitions.
+
+### 6. Verifying Determinism
+You can verify that the simulation is bit-for-bit deterministic by running the reproduction script:
+
+```bash
+cd tests-turmoil
+./repro_determinism.sh
+```
+
+This script runs the fuzzer 10 times with the same seed, normalizes the logs (by masking timestamps), and verifies that the resulting execution traces are identical using SHA256 hashes.
 
 ## Running the Fuzzer
 

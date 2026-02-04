@@ -1,10 +1,12 @@
-//! Cluster management for turmoil tests.
-
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use openraft::async_runtime::WatchReceiver;
 use openraft::Config;
+use openraft_rt_tokio::DETERMINISTIC_RNG;
+use rand_09::SeedableRng;
+use rand_09::rngs::SmallRng;
 use turmoil::net::TcpListener;
 use turmoil::Sim;
 
@@ -42,6 +44,8 @@ pub struct ClusterConfig {
     pub num_nodes: usize,
     /// Raft configuration.
     pub raft_config: Config,
+    /// Seed for deterministic RNG.
+    pub seed: u64,
 }
 
 impl Default for ClusterConfig {
@@ -54,6 +58,7 @@ impl Default for ClusterConfig {
                 election_timeout_max: 500,
                 ..Default::default()
             },
+            seed: 0,
         }
     }
 }
@@ -125,13 +130,15 @@ pub fn spawn_cluster(
         let all_nodes = nodes.clone();
         let host_name = ClusterInfo::host_name(node_id);
         let cluster_state = cluster_state.clone();
+        let node_seed = config.seed.wrapping_add(node_id);
 
         sim.host(host_name, move || {
             let raft_config = raft_config.clone();
             let all_nodes = all_nodes.clone();
             let cluster_state = cluster_state.clone();
+            let rng = RefCell::new(SmallRng::seed_from_u64(node_seed));
 
-            async move {
+            DETERMINISTIC_RNG.scope(rng, async move {
                 // Start RPC server FIRST so other nodes can connect
                 let listener = TcpListener::bind("0.0.0.0:9000").await.expect("Failed to bind");
                 tracing::info!(node_id, "RPC server listening");
@@ -189,7 +196,7 @@ pub fn spawn_cluster(
                         }
                     }
                 }
-            }
+            })
         });
     }
 

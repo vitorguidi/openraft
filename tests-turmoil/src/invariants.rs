@@ -210,6 +210,8 @@ impl InvariantChecker {
     /// INVARIANT 2: Log Matching
     /// If two logs contain an entry with the same index and term,
     /// then the logs are identical in all preceding entries.
+    ///
+    /// Note: We only check up to the commit index of each node.
     pub fn check_log_matching(&self) -> Vec<InvariantViolation> {
         let mut violations = vec![];
         let node_ids: Vec<_> = self.node_states.keys().copied().collect();
@@ -219,12 +221,18 @@ impl InvariantChecker {
                 let node_a = node_ids[i];
                 let node_b = node_ids[j];
 
-                let log_a = &self.node_states[&node_a].log;
-                let log_b = &self.node_states[&node_b].log;
+                let state_a = &self.node_states[&node_a];
+                let state_b = &self.node_states[&node_b];
 
-                // Build index maps
-                let map_a: HashMap<u64, u64> = log_a.iter().map(|e| (e.index, e.term)).collect();
-                let map_b: HashMap<u64, u64> = log_b.iter().map(|e| (e.index, e.term)).collect();
+                let log_a = &state_a.log;
+                let log_b = &state_b.log;
+
+                let commit_a = state_a.commit_index;
+                let commit_b = state_b.commit_index;
+
+                // Build index maps, only including entries up to commit_index
+                let map_a: HashMap<u64, u64> = log_a.iter().filter(|e| e.index <= commit_a).map(|e| (e.index, e.term)).collect();
+                let map_b: HashMap<u64, u64> = log_b.iter().filter(|e| e.index <= commit_b).map(|e| (e.index, e.term)).collect();
 
                 // Check for matching entries
                 for (index, term_a) in &map_a {
@@ -387,9 +395,9 @@ pub fn check_state_invariants(snapshots: &[(NodeId, RaftStateSnapshot)]) -> Inva
             let (id_a, s_a) = &snapshots[i];
             let (id_b, s_b) = &snapshots[j];
 
-            // For every index present in both log_id_lists, the term must be the same
-            let last_a = s_a.log_ids.last().map(|id: &LogId| id.index()).unwrap_or(0);
-            let last_b = s_b.log_ids.last().map(|id: &LogId| id.index()).unwrap_or(0);
+            // For every index present in both log_id_lists AND committed in both nodes, the term must be the same
+            let last_a = s_a.committed.map(|id: LogId| id.index()).unwrap_or(0);
+            let last_b = s_b.committed.map(|id: LogId| id.index()).unwrap_or(0);
 
             let first_a = s_a.log_ids.purged().map(|id: &LogId| id.index()).unwrap_or(0);
             let first_b = s_b.log_ids.purged().map(|id: &LogId| id.index()).unwrap_or(0);

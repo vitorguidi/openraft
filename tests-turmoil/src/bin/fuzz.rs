@@ -13,9 +13,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use rand::rngs::SmallRng;
-use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use openraft::ReadPolicy;
+use rand_09::rngs::StdRng;
+use rand_09::{Rng, SeedableRng};
+use rand::rngs::SmallRng as SmallRng08;
+use rand::SeedableRng as SeedableRng08;
 
 use tests_turmoil::cluster::{spawn_cluster, ClusterConfig};
 use tests_turmoil::invariants::check_metrics_invariants;
@@ -58,6 +60,9 @@ fn main() {
                 .add_directive("openraft=info".parse().unwrap())
                 .add_directive("tests_turmoil=info".parse().unwrap()),
         )
+        .with_ansi(false)
+        .without_time()
+        .with_target(false)
         .init();
 
     // Parse args
@@ -198,7 +203,7 @@ struct FuzzResult {
 }
 
 fn run_fuzz_test(config: &FuzzConfig, seed: u64, running: Arc<AtomicBool>) -> FuzzResult {
-    let rng = Box::new(SmallRng::seed_from_u64(seed));
+    let rng = Box::new(SmallRng08::seed_from_u64(seed));
     let mut sim = turmoil::Builder::new()
         .simulation_duration(Duration::from_secs(3600)) // Long duration, we control via steps
         .fail_rate(config.fail_rate)
@@ -207,9 +212,9 @@ fn run_fuzz_test(config: &FuzzConfig, seed: u64, running: Arc<AtomicBool>) -> Fu
 
     // Randomize Raft config based on seed
     let raft_config = openraft::Config {
-        heartbeat_interval: 50 + (seed % 50),
-        election_timeout_min: 150 + (seed % 100),
-        election_timeout_max: 300 + (seed % 150),
+        heartbeat_interval: 100 + (seed % 100),
+        election_timeout_min: 500 + (seed % 200),
+        election_timeout_max: 1000 + (seed % 300),
         ..Default::default()
     };
 
@@ -218,6 +223,7 @@ fn run_fuzz_test(config: &FuzzConfig, seed: u64, running: Arc<AtomicBool>) -> Fu
         ClusterConfig {
             num_nodes: config.num_nodes,
             raft_config,
+            seed,
         },
     );
 
@@ -230,8 +236,8 @@ fn run_fuzz_test(config: &FuzzConfig, seed: u64, running: Arc<AtomicBool>) -> Fu
             let mut rng = StdRng::seed_from_u64(chaos_seed);
 
             loop {
-                // Random delay between chaos events
-                let delay = rng.gen_range(100..1000);
+                // Random delay between chaos events (longer stability windows)
+                let delay = rng.gen_range(1000..5000);
                 tokio::time::sleep(Duration::from_millis(delay)).await;
 
                 let chaos_type = rng.gen_range(0..6);
@@ -298,13 +304,14 @@ fn run_fuzz_test(config: &FuzzConfig, seed: u64, running: Arc<AtomicBool>) -> Fu
 
         sim.client("workload", async move {
             let mut rng = StdRng::seed_from_u64(workload_seed);
-            let mut write_count = 0u64;
+            let mut op_count = 0u64;
 
             loop {
-                let delay = rng.gen_range(50..200);
+                // Use a modest delay in virtual time (10-50ms)
+                let delay = rng.gen_range(10..50);
                 tokio::time::sleep(Duration::from_millis(delay)).await;
 
-                // Find leader and write
+                // Find leader
                 let leader = {
                     let state = cluster_state_clone.lock().unwrap();
                     state
@@ -318,21 +325,40 @@ fn run_fuzz_test(config: &FuzzConfig, seed: u64, running: Arc<AtomicBool>) -> Fu
                 };
 
                 if let Some((leader_id, raft)) = leader {
-                    let key = format!("key-{}", write_count % 100);
-                    let value = format!("value-{}-{}", write_count, rng.r#gen::<u32>());
+                    let do_write = rng.gen_bool(0.5);
 
-                    let req = tests_turmoil::typ::Request {
-                        client_id: "workload".to_string(),
-                        serial: write_count,
-                        key: key.clone(),
-                        value: value.clone(),
-                    };
-                    tracing::info!("WORKLOAD: writing {}={} to leader {}", key, value, leader_id);
-                    if raft.client_write(req).await.is_ok() {
-                        tracing::info!("WORKLOAD: write {} successful", write_count);
-                        write_count += 1;
+                    if do_write {
+                        let key = format!("key-{}", op_count % 100);
+                        let value = format!("value-{}-{}", op_count, rng.r#gen::<u32>());
+
+                        let req = tests_turmoil::typ::Request {
+                            client_id: "workload".to_string(),
+                            serial: op_count,
+                            key: key.clone(),
+                            value: value.clone(),
+                        };
+                        tracing::info!("WORKLOAD: writing {}={} to leader {}", key, value, leader_id);
+                        if raft.client_write(req).await.is_ok() {
+                            tracing::info!("WORKLOAD: write {} successful", op_count);
+                            op_count += 1;
+                        } else {
+                            tracing::warn!("WORKLOAD: write {} failed", op_count);
+                        }
                     } else {
-                        tracing::warn!("WORKLOAD: write {} failed", write_count);
+                        // Linearizable read
+                        tracing::info!("WORKLOAD: reading from leader {}", leader_id);
+                        match raft.ensure_linearizable(ReadPolicy::LeaseRead).await {
+                            Ok(_) => {
+                                // Once leadership is confirmed, we can read from the state machine.
+                                // In a real app, you'd query your state machine here.
+                                // Here we just log success.
+                                tracing::info!("WORKLOAD: linearizable read successful from leader {}", leader_id);
+                                op_count += 1;
+                            }
+                            Err(e) => {
+                                tracing::warn!("WORKLOAD: linearizable read failed from leader {}: {}", leader_id, e);
+                            }
+                        }
                     }
                 } else {
                     tracing::info!("WORKLOAD: no leader found");
