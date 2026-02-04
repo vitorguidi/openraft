@@ -182,13 +182,13 @@ pub async fn handle_rpc(raft: Arc<Raft>, mut stream: TcpStream) -> io::Result<()
         x if x == RpcType::AppendEntries as u8 => {
             let req: AppendEntriesRequest =
                 bincode::deserialize(&payload).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            let resp = raft.append_entries(req).await;
+            let resp = raft.append_entries(req).await.map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
             bincode::serialize(&resp).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
         }
         x if x == RpcType::Vote as u8 => {
             let req: VoteRequest =
                 bincode::deserialize(&payload).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            let resp = raft.vote(req).await;
+            let resp = raft.vote(req).await.map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
             bincode::serialize(&resp).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
         }
         x if x == RpcType::InstallSnapshot as u8 => {
@@ -201,7 +201,8 @@ pub async fn handle_rpc(raft: Arc<Raft>, mut stream: TcpStream) -> io::Result<()
             };
             let resp = raft
                 .install_full_snapshot(req.vote, snapshot)
-                .await;
+                .await
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
             bincode::serialize(&resp).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
         }
         x if x == RpcType::ClientWrite as u8 => {
