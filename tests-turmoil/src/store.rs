@@ -253,9 +253,9 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachine> {
         let _ = openraft_rt_tokio::DETERMINISTIC_RNG.try_with(|rng| {
             use rand_09::RngCore;
             let val = rng.borrow_mut().next_u64();
+            tracing::info!("SM bug: node-specific random value generated: {}", val);
             data.data.insert(format!("bug-{}", val % 1000), format!("value-{}", val));
         });
-
         Ok(())
     }
 

@@ -316,9 +316,11 @@ where C: RaftTypeConfig
 
         // If resp.vote is different, it may be a delay response to previous voting.
         if resp.vote_granted && &resp.vote == candidate.vote_ref() {
-            // INTENTIONAL BUG: become leader upon receiving a single vote
-            tracing::info!("a vote was granted, becoming leader UNCONDITIONALLY");
-            self.establish_leader();
+            let quorum_granted = candidate.grant_by(&target);
+            if quorum_granted {
+                tracing::info!("a quorum granted my vote");
+                self.establish_leader();
+            }
             return;
         }
 

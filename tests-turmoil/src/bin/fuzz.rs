@@ -7,50 +7,66 @@
 //! In fuzz mode, runs multiple iterations with state space exploration.
 //! In reproduce mode, runs a single iteration with exact seed for debugging.
 
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rand::rngs::SmallRng;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
-use tests_turmoil::cluster::{spawn_cluster, ClusterConfig};
+use tests_turmoil::cluster::{register_node_storage, spawn_host, ClusterInfo, ClusterState};
 use tests_turmoil::invariants::check_state_invariants;
+use tests_turmoil::typ::*;
 
 /// Config derived deterministically from a seed
 #[derive(Debug, Clone)]
 struct DerivedConfig {
-    num_nodes: usize,
+    num_initial_nodes: usize,
+    max_potential_nodes: u64,
     fail_rate: f64,
     heartbeat_interval: u64,
     election_timeout_min: u64,
     election_timeout_max: u64,
     enable_chaos: bool,
+    restart_chance: f64,
+    chaos_interval: u64,
+    membership_interval: u64,
 }
 
 impl DerivedConfig {
     fn from_seed(seed: u64) -> Self {
         let mut rng = StdRng::seed_from_u64(seed);
+        let heartbeat_interval = 50 + rng.gen_range(0..100);
+        let election_timeout_min = heartbeat_interval * rng.gen_range(2..4);
         Self {
-            num_nodes: 3 + rng.gen_range(0..5),                    // 3-7 nodes
-            fail_rate: rng.gen_range(0.0..0.15),                   // 0-15%
-            heartbeat_interval: 50 + rng.gen_range(0..50),         // 50-100ms
-            election_timeout_min: 150 + rng.gen_range(0..100),     // 150-250ms
-            election_timeout_max: 300 + rng.gen_range(0..200),     // 300-500ms
+            num_initial_nodes: 3 + rng.gen_range(0..3),            // 3-5 nodes initially
+            max_potential_nodes: 10,                               // Max nodes for membership changes
+            fail_rate: rng.gen_range(0.0..0.08),                   // 0-8%
+            heartbeat_interval,
+            election_timeout_min,
+            election_timeout_max: election_timeout_min + rng.gen_range(100..500),
             enable_chaos: rng.gen_bool(0.8),                       // 80% chance of chaos
+            restart_chance: rng.gen_range(0.01..0.05),             // 1-5% restart chance
+            chaos_interval: rng.gen_range(2000..5000),             // Chaos every 2-5k steps
+            membership_interval: rng.gen_range(10000..25000),      // Membership change every 10-25k steps
         }
     }
 
     fn to_json(&self) -> serde_json::Value {
         serde_json::json!({
-            "num_nodes": self.num_nodes,
+            "num_initial_nodes": self.num_initial_nodes,
+            "max_potential_nodes": self.max_potential_nodes,
             "fail_rate": self.fail_rate,
             "heartbeat_interval": self.heartbeat_interval,
             "election_timeout_min": self.election_timeout_min,
             "election_timeout_max": self.election_timeout_max,
-            "enable_chaos": self.enable_chaos
+            "enable_chaos": self.enable_chaos,
+            "restart_chance": self.restart_chance,
+            "chaos_interval": self.chaos_interval,
+            "membership_interval": self.membership_interval
         })
     }
 }
@@ -175,12 +191,16 @@ fn run_reproduce_mode(iteration_seed: u64, max_steps: u64, crash_file: Option<St
     let derived = DerivedConfig::from_seed(iteration_seed);
     println!();
     println!("Derived config:");
-    println!("  num_nodes: {}", derived.num_nodes);
+    println!("  num_initial_nodes: {}", derived.num_initial_nodes);
+    println!("  max_potential_nodes: {}", derived.max_potential_nodes);
     println!("  fail_rate: {:.4}", derived.fail_rate);
     println!("  heartbeat_interval: {}ms", derived.heartbeat_interval);
     println!("  election_timeout_min: {}ms", derived.election_timeout_min);
     println!("  election_timeout_max: {}ms", derived.election_timeout_max);
     println!("  enable_chaos: {}", derived.enable_chaos);
+    println!("  restart_chance: {:.4}", derived.restart_chance);
+    println!("  chaos_interval: {}", derived.chaos_interval);
+    println!("  membership_interval: {}", derived.membership_interval);
     println!("======================================");
     println!();
 
@@ -284,7 +304,7 @@ fn run_fuzz_mode(base_seed: u64, max_steps: u64, iterations: u64, crash_file: Op
             "--- Iteration {} (seed: {}, nodes: {}, fail_rate: {:.2}%, chaos: {}) ---",
             iteration + 1,
             iteration_seed,
-            derived.num_nodes,
+            derived.num_initial_nodes,
             derived.fail_rate * 100.0,
             derived.enable_chaos
         );
@@ -302,12 +322,16 @@ fn run_fuzz_mode(base_seed: u64, max_steps: u64, iterations: u64, crash_file: Op
             println!("Invariant checks: {}", result.invariant_checks);
             println!();
             println!("Derived config:");
-            println!("  num_nodes: {}", derived.num_nodes);
+            println!("  num_initial_nodes: {}", derived.num_initial_nodes);
+            println!("  max_potential_nodes: {}", derived.max_potential_nodes);
             println!("  fail_rate: {:.4}", derived.fail_rate);
             println!("  heartbeat_interval: {}ms", derived.heartbeat_interval);
             println!("  election_timeout_min: {}ms", derived.election_timeout_min);
             println!("  election_timeout_max: {}ms", derived.election_timeout_max);
             println!("  enable_chaos: {}", derived.enable_chaos);
+            println!("  restart_chance: {:.4}", derived.restart_chance);
+            println!("  chaos_interval: {}", derived.chaos_interval);
+            println!("  membership_interval: {}", derived.membership_interval);
             println!();
             println!("Violations:");
             for v in &result.violations {
@@ -372,72 +396,76 @@ fn run_single_iteration(
     let mut sim = turmoil::Builder::new()
         .simulation_duration(Duration::from_secs(3600))
         .fail_rate(derived.fail_rate)
+        .enable_random_order()
+        .tcp_capacity(65536)
         .build_with_rng(rng);
 
-    let raft_config = openraft::Config {
+    let raft_config = Arc::new(openraft::Config {
         heartbeat_interval: derived.heartbeat_interval,
         election_timeout_min: derived.election_timeout_min,
         election_timeout_max: derived.election_timeout_max,
         ..Default::default()
-    };
+    });
 
-    let (_cluster_info, cluster_state) = spawn_cluster(
-        &mut sim,
-        ClusterConfig {
-            num_nodes: derived.num_nodes,
-            raft_config,
-            seed: iteration_seed,
-        },
-    );
+    let cluster_state = Arc::new(Mutex::new(ClusterState::new()));
+    let next_membership = Arc::new(Mutex::new(None::<HashSet<NodeId>>));
+
+    // Pre-register ALL potential hosts for dynamic membership
+    let mut all_possible_nodes = BTreeMap::new();
+    for id in 1..=derived.max_potential_nodes {
+        all_possible_nodes.insert(id, Node { addr: format!("{}:9000", ClusterInfo::host_name(id)) });
+    }
+
+    for id in 1..=derived.max_potential_nodes {
+        register_node_storage(id, &cluster_state);
+        spawn_host(&mut sim, id, raft_config.clone(), cluster_state.clone(), iteration_seed, all_possible_nodes.clone());
+    }
 
     // Add chaos agent if enabled
     if derived.enable_chaos {
         let chaos_seed = iteration_seed.wrapping_add(1000);
-        let num_nodes = derived.num_nodes;
+        let max_nodes = derived.max_potential_nodes;
 
         sim.client("chaos-agent", async move {
             let mut rng = StdRng::seed_from_u64(chaos_seed);
 
             loop {
-                let delay = rng.gen_range(100..1000);
+                let delay = rng.gen_range(1000..5000);
                 tokio::time::sleep(Duration::from_millis(delay)).await;
 
-                let chaos_type = rng.gen_range(0..6);
+                let chaos_type = rng.gen_range(0..5);
                 match chaos_type {
                     0 => {
                         // Partition a random node
-                        let victim = rng.gen_range(1..=num_nodes);
+                        let victim = rng.gen_range(1..=max_nodes);
                         let victim_name = format!("node-{}", victim);
-                        for i in 1..=num_nodes {
+                        for i in 1..=max_nodes {
                             if i != victim {
-                                let other = format!("node-{}", i);
-                                turmoil::partition(victim_name.clone(), other);
+                                turmoil::partition(victim_name.clone(), format!("node-{}", i));
                             }
                         }
                     }
                     1 => {
                         // Repair all partitions
-                        for i in 1..=num_nodes {
-                            for j in (i + 1)..=num_nodes {
-                                let a = format!("node-{}", i);
-                                let b = format!("node-{}", j);
-                                turmoil::repair(a, b);
+                        for i in 1..=max_nodes {
+                            for j in (i + 1)..=max_nodes {
+                                turmoil::repair(format!("node-{}", i), format!("node-{}", j));
                             }
                         }
                     }
                     2 => {
                         // Hold messages between two random nodes
-                        let a = rng.gen_range(1..=num_nodes);
-                        let mut b = rng.gen_range(1..=num_nodes);
+                        let a = rng.gen_range(1..=max_nodes);
+                        let mut b = rng.gen_range(1..=max_nodes);
                         while b == a {
-                            b = rng.gen_range(1..=num_nodes);
+                            b = rng.gen_range(1..=max_nodes);
                         }
                         turmoil::hold(format!("node-{}", a), format!("node-{}", b));
                     }
                     3 => {
                         // Release all holds
-                        for i in 1..=num_nodes {
-                            for j in 1..=num_nodes {
+                        for i in 1..=max_nodes {
+                            for j in 1..=max_nodes {
                                 if i != j {
                                     turmoil::release(format!("node-{}", i), format!("node-{}", j));
                                 }
@@ -455,6 +483,43 @@ fn run_single_iteration(
         });
     }
 
+    // Add membership-agent for executing membership changes
+    {
+        let cluster_state_clone = cluster_state.clone();
+        let next_membership_clone = next_membership.clone();
+        sim.client("membership-agent", async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let target_set = {
+                    let mut guard = next_membership_clone.lock().unwrap();
+                    guard.take()
+                };
+                if let Some(new_set) = target_set {
+                    let leader = {
+                        let state = cluster_state_clone.lock().unwrap();
+                        state.rafts.iter()
+                            .find(|(_, raft)| {
+                                use openraft::async_runtime::WatchReceiver;
+                                raft.metrics().borrow_watched().state.is_leader()
+                            })
+                            .map(|(_, raft)| raft.clone())
+                    };
+                    if let Some(raft) = leader {
+                        println!("MEMBERSHIP-AGENT: executing change to {:?}", new_set);
+                        let _ = raft.change_membership(new_set, false).await;
+                    } else {
+                        // Re-queue on failure
+                        let mut guard = next_membership_clone.lock().unwrap();
+                        if guard.is_none() { *guard = Some(new_set); }
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                    }
+                }
+            }
+            #[allow(unreachable_code)]
+            Ok(())
+        });
+    }
+
     // Add workload client
     {
         let cluster_state_clone = cluster_state.clone();
@@ -465,7 +530,7 @@ fn run_single_iteration(
             let mut write_count = 0u64;
 
             loop {
-                let delay = rng.gen_range(50..200);
+                let delay = rng.gen_range(10..50);
                 tokio::time::sleep(Duration::from_millis(delay)).await;
 
                 let leader = {
@@ -477,14 +542,14 @@ fn run_single_iteration(
                             use openraft::async_runtime::WatchReceiver;
                             raft.metrics().borrow_watched().state.is_leader()
                         })
-                        .map(|(&id, raft)| (id, raft.clone()))
+                        .map(|(_, raft)| raft.clone())
                 };
 
-                if let Some((_leader_id, raft)) = leader {
-                    let key = format!("key-{}", write_count % 100);
+                if let Some(raft) = leader {
+                    let key = format!("key-{}", write_count % 1000);
                     let value = format!("value-{}-{}", write_count, rng.r#gen::<u32>());
 
-                    let req = tests_turmoil::typ::Request {
+                    let req = Request {
                         client_id: "workload".to_string(),
                         serial: write_count,
                         key,
@@ -505,6 +570,11 @@ fn run_single_iteration(
     let mut steps: u64 = 0;
     let mut invariant_checks: u64 = 0;
     let mut violations: Vec<String> = Vec::new();
+    let mut chaos_rng = StdRng::seed_from_u64(iteration_seed.wrapping_add(3000));
+    let mut member_rng = StdRng::seed_from_u64(iteration_seed.wrapping_add(5000));
+
+    let mut active_voters: HashSet<NodeId> = (1..=derived.num_initial_nodes as u64).collect();
+    let mut next_node_id = (derived.num_initial_nodes as u64) + 1;
 
     println!("Starting simulation...");
 
@@ -519,20 +589,57 @@ fn run_single_iteration(
             break;
         }
 
-        match sim.step() {
-            Ok(_) => {
-                steps += 1;
-            }
-            Err(e) => {
-                let err_str = e.to_string();
-                if err_str.contains("duration") || err_str.contains("without completing") {
-                    println!("Simulation duration reached at step {}", steps);
-                } else {
-                    println!("Simulation error at step {}: {}", steps, e);
+        // Membership changes
+        if steps > 0 && steps % derived.membership_interval == 0 {
+            let add = active_voters.len() < 3 || (active_voters.len() < 7 && member_rng.gen_bool(0.7));
+            if add {
+                if next_node_id <= derived.max_potential_nodes {
+                    println!("MEMBERSHIP: Requesting add node {}...", next_node_id);
+                    active_voters.insert(next_node_id);
+                    next_node_id += 1;
+                    *next_membership.lock().unwrap() = Some(active_voters.clone());
                 }
-                break;
+            } else if active_voters.len() > 3 {
+                let victim = *active_voters.iter().next().unwrap();
+                println!("MEMBERSHIP: Requesting remove node {}...", victim);
+                active_voters.remove(&victim);
+                *next_membership.lock().unwrap() = Some(active_voters.clone());
             }
         }
+
+        // Crash restarts
+        if steps > 0 && steps % derived.chaos_interval == 0 && chaos_rng.gen_bool(derived.restart_chance) {
+            let voters: Vec<_> = active_voters.iter().collect();
+            if !voters.is_empty() {
+                let victim = **voters.get(chaos_rng.gen_range(0..voters.len())).unwrap();
+                tests_turmoil::cluster::restart_node(&mut sim, victim);
+            }
+        }
+
+        // Step simulation until no more tasks
+        loop {
+            match sim.step() {
+                Ok(more_tasks) => {
+                    if !more_tasks {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    let err_str = e.to_string();
+                    if err_str.contains("duration") || err_str.contains("without completing") {
+                        println!("Simulation duration reached at step {}", steps);
+                    } else {
+                        println!("Simulation error at step {}: {}", steps, e);
+                    }
+                    return FuzzResult {
+                        steps_completed: steps,
+                        invariant_checks,
+                        violations,
+                    };
+                }
+            }
+        }
+        steps += 1;
 
         // Check invariants after every step
         let (metrics, snapshots) = {
@@ -544,7 +651,7 @@ fn run_single_iteration(
         if !result.passed {
             for v in &result.violations {
                 let msg = format!("Step {}: {:?}", steps, v);
-                println!("b {}", msg);
+                println!("VIOLATION: {}", msg);
                 violations.push(msg);
             }
             return FuzzResult {
@@ -554,8 +661,8 @@ fn run_single_iteration(
             };
         }
 
-        // Progress report every 10000 steps
-        if steps % 10000 == 0 {
+        // Progress report every 5000 steps
+        if steps % 5000 == 0 {
             let leaders: Vec<_> = metrics
                 .iter()
                 .filter(|(_, m)| m.state.is_leader())
@@ -568,13 +675,17 @@ fn run_single_iteration(
                 .unwrap_or(0);
 
             println!(
-                "[Step {}] leaders={:?}, term={}, checks={}, violations={}",
+                "[Step {}] leaders={:?}, term={}, voters={:?}, checks={}",
                 steps,
                 leaders,
                 max_term,
-                invariant_checks,
-                violations.len()
+                active_voters,
+                invariant_checks
             );
+        }
+
+        if !violations.is_empty() {
+            break;
         }
     }
 
@@ -582,6 +693,5 @@ fn run_single_iteration(
         steps_completed: steps,
         invariant_checks,
         violations,
-        
     }
 }
