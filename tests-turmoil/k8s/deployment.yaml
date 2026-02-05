@@ -1,0 +1,49 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: detsim-orchestrator
+  namespace: openraft-testing
+  labels:
+    app: detsim-orchestrator
+spec:
+  replicas: 1  # Single instance to avoid seed collision
+  selector:
+    matchLabels:
+      app: detsim-orchestrator
+  template:
+    metadata:
+      labels:
+        app: detsim-orchestrator
+    spec:
+      serviceAccountName: detsim-sa
+      containers:
+      - name: orchestrator
+        image: ghcr.io/datafuselabs/openraft-detsim:latest
+        imagePullPolicy: Always
+        resources:
+          requests:
+            cpu: "2"
+            memory: "4Gi"
+          limits:
+            cpu: "4"
+            memory: "8Gi"
+        env:
+        - name: DETSIM_GCS_BUCKET
+          value: "openraft-detsim-logs"
+        - name: DETSIM_FUZZ_BINARY
+          value: "/usr/local/bin/fuzz"
+        - name: DETSIM_MAX_STEPS
+          value: "100000"
+        - name: DETSIM_ITERATIONS
+          value: "100"
+        - name: DETSIM_DRY_RUN
+          value: "false"
+        - name: RUST_LOG
+          value: "info"
+      restartPolicy: Always
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: detsim-sa
+  namespace: openraft-testing

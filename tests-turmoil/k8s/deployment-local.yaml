@@ -1,0 +1,45 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: detsim-orchestrator
+  namespace: openraft-testing
+  labels:
+    app: detsim-orchestrator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: detsim-orchestrator
+  template:
+    metadata:
+      labels:
+        app: detsim-orchestrator
+    spec:
+      containers:
+      - name: orchestrator
+        image: openraft-detsim:latest
+        imagePullPolicy: Never  # Use local image loaded into kind
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "512Mi"
+          limits:
+            cpu: "2"
+            memory: "2Gi"
+        env:
+        - name: DETSIM_FUZZ_BINARY
+          value: "/usr/local/bin/fuzz"
+        - name: DETSIM_MAX_STEPS
+          value: "100000"
+        - name: DETSIM_ITERATIONS
+          value: "10"
+        - name: DETSIM_DRY_RUN
+          value: "true"
+        - name: RUST_LOG
+          value: "info"
+      restartPolicy: Always
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: openraft-testing

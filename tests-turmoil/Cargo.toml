@@ -11,6 +11,14 @@ publish = false
 name = "fuzz"
 path = "src/bin/fuzz.rs"
 
+[[bin]]
+name = "fake_fuzz"
+path = "src/bin/fake_fuzz.rs"
+
+[[bin]]
+name = "orchestrator"
+path = "src/bin/orchestrator.rs"
+
 [dependencies]
 openraft = { path = "../openraft", features = ["type-alias", "serde"] }
 openraft-rt-tokio = { path = "../rt-tokio" }
@@ -28,6 +36,7 @@ tokio = { version = "1.39", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 turmoil = "0.6"
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 test-harness = "0.3"
