@@ -372,6 +372,27 @@ pub fn check_state_invariants(snapshots: &[(NodeId, FullNodeSnapshot)]) -> Invar
             if let (Some(applied_a), Some(applied_b)) = (s_a.sm.last_applied, s_b.sm.last_applied) {
                 if applied_a == applied_b {
                     if s_a.sm.data != s_b.sm.data {
+                        // Print the differing data for debugging
+                        println!("SM DIVERGENCE at index {}:", applied_a.index());
+                        println!("  Node {} data: {:?}", id_a, s_a.sm.data);
+                        println!("  Node {} data: {:?}", id_b, s_b.sm.data);
+
+                        // Find keys that differ
+                        for (key, val_a) in &s_a.sm.data {
+                            if let Some(val_b) = s_b.sm.data.get(key) {
+                                if val_a != val_b {
+                                    println!("  DIFF key '{}': node{}='{}' vs node{}='{}'", key, id_a, val_a, id_b, val_b);
+                                }
+                            } else {
+                                println!("  ONLY node{} has key '{}' = '{}'", id_a, key, val_a);
+                            }
+                        }
+                        for (key, val_b) in &s_b.sm.data {
+                            if !s_a.sm.data.contains_key(key) {
+                                println!("  ONLY node{} has key '{}' = '{}'", id_b, key, val_b);
+                            }
+                        }
+
                         violations.push(InvariantViolation::StateMachineDivergence {
                             index: applied_a.index() as u64,
                             nodes: vec![*id_a, *id_b],
