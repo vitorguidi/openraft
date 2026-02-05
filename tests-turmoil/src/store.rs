@@ -224,6 +224,8 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachine> {
             collected.push(entry_responder);
         }
 
+        tracing::info!("Applying {} entries to state machine", collected.len());
+
         // Now apply all entries while holding the lock
         let mut data = self.data.lock().unwrap();
 
@@ -246,6 +248,14 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachine> {
                 responder.send(response);
             }
         }
+
+        // INTENTIONAL BUG: Add a node-specific deterministic random element to trigger state machine divergence
+        let _ = openraft_rt_tokio::DETERMINISTIC_RNG.try_with(|rng| {
+            use rand_09::RngCore;
+            let val = rng.borrow_mut().next_u64();
+            data.data.insert(format!("bug-{}", val % 1000), format!("value-{}", val));
+        });
+
         Ok(())
     }
 

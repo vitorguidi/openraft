@@ -2,7 +2,7 @@
 //!
 //! Modes:
 //!   Fuzz mode:      fuzz --seed <SEED> --max-steps <N> [--crash-file <PATH>]
-//!   Reproduce mode: fuzz --reproduce <ITERATION_SEED> --max-steps <N>
+//!   Reproduce mode: fuzz --reproduce <ITERATION_SEED> --max-steps <N> [--crash-file <PATH>]
 //!
 //! In fuzz mode, runs multiple iterations with state space exploration.
 //! In reproduce mode, runs a single iteration with exact seed for debugging.
@@ -86,7 +86,9 @@ fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("tests_turmoil=info".parse().unwrap()),
+                .add_directive("openraft=trace".parse().unwrap())
+                .add_directive("tests_turmoil=debug".parse().unwrap())
+                .add_directive("info".parse().unwrap()), // Default to info for others
         )
         .init();
 
@@ -131,7 +133,7 @@ fn main() {
 
     // Dispatch to appropriate mode
     if let Some(iteration_seed) = config.reproduce_seed {
-        run_reproduce_mode(iteration_seed, config.max_steps);
+        run_reproduce_mode(iteration_seed, config.max_steps, config.crash_file);
     } else {
         let base_seed = config.base_seed.unwrap_or_else(|| {
             std::time::SystemTime::now()
@@ -152,7 +154,7 @@ fn print_help() {
     println!("    fuzz --seed <SEED> --max-steps <N> [--iterations <N>] [--crash-file <PATH>]");
     println!();
     println!("  Reproduce mode (run single iteration with exact seed):");
-    println!("    fuzz --reproduce <ITERATION_SEED> --max-steps <N>");
+    println!("    fuzz --reproduce <ITERATION_SEED> --max-steps <N> [--crash-file <PATH>]");
     println!();
     println!("OPTIONS:");
     println!("  -s, --seed <SEED>           Base RNG seed for fuzzing [default: random]");
@@ -164,10 +166,11 @@ fn print_help() {
 }
 
 /// Reproduce mode: run a single iteration with the exact seed
-fn run_reproduce_mode(iteration_seed: u64, max_steps: u64) {
+fn run_reproduce_mode(iteration_seed: u64, max_steps: u64, crash_file: Option<String>) {
     println!("=== OpenRaft Fuzzer REPRODUCE MODE ===");
     println!("Iteration seed: {}", iteration_seed);
     println!("Max steps: {}", max_steps);
+    println!("Crash file: {:?}", crash_file);
 
     let derived = DerivedConfig::from_seed(iteration_seed);
     println!();
@@ -193,6 +196,7 @@ fn run_reproduce_mode(iteration_seed: u64, max_steps: u64) {
     let result = run_single_iteration(iteration_seed, &derived, max_steps, running);
 
     if !result.violations.is_empty() {
+        // Print failure info
         println!();
         println!("=== REPRODUCED FAILURE ===");
         println!("Steps completed: {}", result.steps_completed);
@@ -202,6 +206,34 @@ fn run_reproduce_mode(iteration_seed: u64, max_steps: u64) {
         for v in &result.violations {
             println!("  - {}", v);
         }
+        println!();
+        println!("REPRODUCE WITH:");
+        println!(
+            "  cargo run --bin fuzz -- --reproduce {} --max-steps {}",
+            iteration_seed, max_steps
+        );
+
+        // Write crash file
+        if let Some(path) = &crash_file {
+            let crash_info = serde_json::json!({
+                "base_seed": iteration_seed, // In reproduce mode, base_seed is iteration_seed
+                "iteration": 0, // In reproduce mode, it's always the first (0th) iteration
+                "iteration_seed": iteration_seed,
+                "max_steps": max_steps,
+                "steps_completed": result.steps_completed,
+                "violation": result.violations.first(),
+                "config": derived.to_json(),
+                "reproduce": {
+                    "command": format!("cargo run --bin fuzz -- --reproduce {} --max-steps {} --crash-file {}", iteration_seed, max_steps, path),
+                    "iteration_seed": iteration_seed,
+                    "max_steps": max_steps
+                }
+            });
+            if let Err(e) = fs::write(path, serde_json::to_string_pretty(&crash_info).unwrap()) {
+                eprintln!("Failed to write crash file: {}", e);
+            }
+        }
+
         std::process::exit(1);
     }
 
@@ -299,7 +331,7 @@ fn run_fuzz_mode(base_seed: u64, max_steps: u64, iterations: u64, crash_file: Op
                     "violation": result.violations.first(),
                     "config": derived.to_json(),
                     "reproduce": {
-                        "command": format!("cargo run --bin fuzz -- --reproduce {} --max-steps {}", iteration_seed, max_steps),
+                        "command": format!("cargo run --bin fuzz -- --reproduce {} --max-steps {} --crash-file {}", iteration_seed, max_steps, path),
                         "iteration_seed": iteration_seed,
                         "max_steps": max_steps
                     }
@@ -340,7 +372,6 @@ fn run_single_iteration(
     let mut sim = turmoil::Builder::new()
         .simulation_duration(Duration::from_secs(3600))
         .fail_rate(derived.fail_rate)
-        .enable_random_order()
         .build_with_rng(rng);
 
     let raft_config = openraft::Config {

@@ -318,15 +318,14 @@ pub fn check_state_invariants(snapshots: &[(NodeId, FullNodeSnapshot)]) -> Invar
     let mut violations = Vec::new();
 
     // Check: At most one leader per term
-    let mut actual_leaders_by_term: HashMap<u64, Vec<NodeId>> = HashMap::new();
+    let mut leaders_by_term: HashMap<u64, Vec<NodeId>> = HashMap::new();
     for (node_id, s) in snapshots {
-        // A node considers itself a leader if its vote contains its own ID as leader for the current term.
-        if s.raft.vote.leader_id().node_id == *node_id {
-            actual_leaders_by_term.entry(s.raft.vote.leader_id().term).or_default().push(*node_id);
+        if s.raft.server_state == openraft::ServerState::Leader {
+            leaders_by_term.entry(s.raft.vote.leader_id().term).or_default().push(*node_id);
         }
     }
 
-    for (term, leaders) in &actual_leaders_by_term {
+    for (term, leaders) in &leaders_by_term {
         if leaders.len() > 1 {
             violations.push(InvariantViolation::MultipleLeadersInTerm {
                 term: *term,
