@@ -86,8 +86,7 @@ fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("openraft=off".parse().unwrap())
-                .add_directive("tests_turmoil=error".parse().unwrap()),
+                .add_directive("tests_turmoil=info".parse().unwrap()),
         )
         .init();
 
@@ -514,9 +513,14 @@ fn run_single_iteration(
         if !result.passed {
             for v in &result.violations {
                 let msg = format!("Step {}: {:?}", steps, v);
-                println!("VIOLATION: {}", msg);
+                println!("b {}", msg);
                 violations.push(msg);
             }
+            return FuzzResult {
+                steps_completed: steps,
+                invariant_checks,
+                violations,
+            };
         }
 
         // Progress report every 10000 steps
@@ -547,5 +551,6 @@ fn run_single_iteration(
         steps_completed: steps,
         invariant_checks,
         violations,
+        
     }
 }

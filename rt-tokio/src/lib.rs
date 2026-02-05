@@ -5,7 +5,6 @@ use std::time::Duration;
 use openraft_rt::AsyncRuntime;
 use openraft_rt::OptionalSend;
 use rand::RngCore;
-use rand::SeedableRng;
 use rand::rngs::SmallRng;
 
 mod instant;
