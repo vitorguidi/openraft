@@ -334,7 +334,58 @@ pub fn check_state_invariants(snapshots: &[(NodeId, FullNodeSnapshot)]) -> Invar
         }
     }
 
-    // Check: Log consistency and State Machine Safety
+    // 2. Leader Completeness (check BEFORE Log Matching)
+    // If a log entry is committed, it must be present in the logs of all leaders.
+    // We only check the leader in the highest term (current leader), as stale leaders
+    // may not have caught up yet.
+
+    // Find the highest term among all leaders
+    let max_leader_term = snapshots
+        .iter()
+        .filter(|(_, s)| s.raft.server_state == openraft::ServerState::Leader)
+        .map(|(_, s)| s.raft.vote.leader_id().term)
+        .max();
+
+    if let Some(highest_term) = max_leader_term {
+        // Find the maximum committed index across all nodes
+        let max_committed_index = snapshots
+            .iter()
+            .filter_map(|(_, s)| s.raft.committed.map(|id| id.index()))
+            .max()
+            .unwrap_or(0);
+
+        // Check that the leader in the highest term has all committed entries
+        for (node_id, s) in snapshots {
+            if s.raft.server_state == openraft::ServerState::Leader {
+                let leader_term = s.raft.vote.leader_id().term;
+
+                // Only check the leader in the highest term
+                if leader_term != highest_term {
+                    continue;
+                }
+
+                let leader_last_log = s.raft.log_ids.last().map(|id| id.index()).unwrap_or(0);
+                let leader_purged = s.raft.log_ids.purged().map(|id| id.index()).unwrap_or(0);
+
+                // Leader must have all committed entries (or have them in snapshot/purged)
+                if leader_last_log < max_committed_index && leader_purged < max_committed_index {
+                    // Leader is missing some committed entries
+                    let missing_start = std::cmp::max(leader_last_log, leader_purged) + 1;
+                    println!(
+                        "LEADER COMPLETENESS: Leader {} (term {}) missing entries {}-{}, has log up to {}, purged up to {}",
+                        node_id, leader_term, missing_start, max_committed_index, leader_last_log, leader_purged
+                    );
+                    violations.push(InvariantViolation::LeaderMissingCommitted {
+                        term: leader_term,
+                        leader: *node_id,
+                        missing_index: missing_start,
+                    });
+                }
+            }
+        }
+    }
+
+    // 3. Check: Log consistency and State Machine Safety
     for i in 0..snapshots.len() {
         for j in (i + 1)..snapshots.len() {
             let (id_a, s_a) = &snapshots[i];
@@ -398,6 +449,57 @@ pub fn check_state_invariants(snapshots: &[(NodeId, FullNodeSnapshot)]) -> Invar
                             nodes: vec![*id_a, *id_b],
                         });
                     }
+                }
+            }
+        }
+    }
+
+    // 3. Leader Completeness
+    // If a log entry is committed, it must be present in the logs of all leaders.
+    // We only check the leader in the highest term (current leader), as stale leaders
+    // may not have caught up yet.
+
+    // Find the highest term among all leaders
+    let max_leader_term = snapshots
+        .iter()
+        .filter(|(_, s)| s.raft.server_state == openraft::ServerState::Leader)
+        .map(|(_, s)| s.raft.vote.leader_id().term)
+        .max();
+
+    if let Some(highest_term) = max_leader_term {
+        // Find the maximum committed index across all nodes
+        let max_committed_index = snapshots
+            .iter()
+            .filter_map(|(_, s)| s.raft.committed.map(|id| id.index()))
+            .max()
+            .unwrap_or(0);
+
+        // Check that the leader in the highest term has all committed entries
+        for (node_id, s) in snapshots {
+            if s.raft.server_state == openraft::ServerState::Leader {
+                let leader_term = s.raft.vote.leader_id().term;
+
+                // Only check the leader in the highest term
+                if leader_term != highest_term {
+                    continue;
+                }
+
+                let leader_last_log = s.raft.log_ids.last().map(|id| id.index()).unwrap_or(0);
+                let leader_purged = s.raft.log_ids.purged().map(|id| id.index()).unwrap_or(0);
+
+                // Leader must have all committed entries (or have them in snapshot/purged)
+                if leader_last_log < max_committed_index && leader_purged < max_committed_index {
+                    // Leader is missing some committed entries
+                    let missing_start = std::cmp::max(leader_last_log, leader_purged) + 1;
+                    println!(
+                        "LEADER COMPLETENESS: Leader {} (term {}) missing entries {}-{}, has log up to {}, purged up to {}",
+                        node_id, leader_term, missing_start, max_committed_index, leader_last_log, leader_purged
+                    );
+                    violations.push(InvariantViolation::LeaderMissingCommitted {
+                        term: leader_term,
+                        leader: *node_id,
+                        missing_index: missing_start,
+                    });
                 }
             }
         }
