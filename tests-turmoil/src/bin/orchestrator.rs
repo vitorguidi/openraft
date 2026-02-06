@@ -23,6 +23,7 @@ struct Config {
     base_seed: u64,
     fuzz_binary: String,
     dry_run: bool,
+    disable_logs: bool,
 }
 
 impl Config {
@@ -55,6 +56,10 @@ impl Config {
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false);
 
+        let disable_logs = std::env::var("DETSIM_DISABLE_LOGS")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
+
         Self {
             gcs_bucket,
             max_steps,
@@ -62,6 +67,7 @@ impl Config {
             base_seed,
             fuzz_binary,
             dry_run,
+            disable_logs,
         }
     }
 }
@@ -83,6 +89,7 @@ fn main() {
     println!("Base seed: {}", config.base_seed);
     println!("Fuzz binary: {}", config.fuzz_binary);
     println!("Dry run: {}", config.dry_run);
+    println!("Disable logs: {}", config.disable_logs);
     println!("===========================");
     println!();
 
@@ -111,7 +118,7 @@ fn main() {
         );
 
         // Upload logs (always)
-        if !config.dry_run {
+        if !config.dry_run && !config.disable_logs {
             upload_run_logs(&config, &run_id, seed, &result);
         }
 
@@ -161,19 +168,24 @@ fn main() {
 }
 
 fn run_fuzzer(config: &Config, seed: u64, crash_file: &str) -> RunResult {
-    let output = Command::new(&config.fuzz_binary)
-        .args([
-            "--seed",
-            &seed.to_string(),
-            "--max-steps",
-            &config.max_steps.to_string(),
-            "--iterations",
-            &config.iterations.to_string(),
-            "--crash-file",
-            crash_file,
-        ])
-        .output()
-        .expect("Failed to execute fuzzer");
+    let mut command = Command::new(&config.fuzz_binary);
+    command.args([
+        "--seed",
+        &seed.to_string(),
+        "--max-steps",
+        &config.max_steps.to_string(),
+        "--iterations",
+        &config.iterations.to_string(),
+        "--crash-file",
+        crash_file,
+    ]);
+
+    if config.disable_logs {
+        command.stdout(std::process::Stdio::null());
+        command.stderr(std::process::Stdio::null());
+    }
+
+    let output = command.output().expect("Failed to execute fuzzer");
 
     RunResult {
         exit_code: output.status.code().unwrap_or(-1),
