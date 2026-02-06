@@ -44,7 +44,7 @@ impl DerivedConfig {
         Self {
             num_initial_nodes: 3 + rng.gen_range(0..3),            // 3-5 nodes initially
             max_potential_nodes: 10,                               // Max nodes for membership changes
-            fail_rate: 0.0,                                        // Forced to 0.0 by user request
+            fail_rate: rng.gen_range(0.0..0.08),                   // 0-8%
             heartbeat_interval,
             election_timeout_min,
             election_timeout_max: election_timeout_min + rng.gen_range(100..500),
