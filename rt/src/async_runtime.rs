@@ -51,7 +51,7 @@ pub trait AsyncRuntime: Debug + OptionalSend + OptionalSync + 'static {
     type Timeout<R, T: Future<Output = R> + OptionalSend>: Future<Output = Result<R, Self::TimeoutError>> + OptionalSend;
 
     /// Type of thread-local random number generator.
-    type ThreadLocalRng: rand::Rng;
+    type ThreadLocalRng: rand::RngCore;
 
     /// Spawn a new task.
     #[track_caller]

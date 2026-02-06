@@ -1,0 +1,53 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: detsim-orchestrator
+  namespace: openraft-detsim
+  labels:
+    app: detsim-orchestrator
+spec:
+  replicas: 90
+  selector:
+    matchLabels:
+      app: detsim-orchestrator
+  template:
+    metadata:
+      labels:
+        app: detsim-orchestrator
+    spec:
+      serviceAccountName: detsim-sa
+      containers:
+      - name: orchestrator
+        image: gcr.io/vitorguidi-sandbox/openraft-detsim:latest
+        imagePullPolicy: IfNotPresent
+        resources:
+          requests:
+            cpu: "1"
+            memory: "4Gi"
+          limits:
+            cpu: "1"
+            memory: "4Gi"
+        env:
+        - name: DETSIM_GCS_BUCKET
+          value: "openraft-detsim"
+        - name: DETSIM_FUZZ_BINARY
+          value: "/usr/local/bin/fuzz"
+        - name: DETSIM_MAX_STEPS
+          value: "10000000000"
+        - name: DETSIM_ITERATIONS
+          value: "0"
+        - name: DETSIM_DRY_RUN
+          value: "false"
+        - name: DETSIM_DISABLE_LOGS
+          value: "true"
+        - name: RUST_LOG
+          value: "info"
+      restartPolicy: Always
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: detsim-sa
+  namespace: openraft-detsim
+  annotations:
+    iam.gke.io/gcp-service-account: detsim-gsa@vitorguidi-sandbox.iam.gserviceaccount.com

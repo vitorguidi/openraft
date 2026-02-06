@@ -119,9 +119,11 @@ use crate::raft::raft_inner::RaftInner;
 pub use crate::raft::runtime_config_handle::RuntimeConfigHandle;
 use crate::raft::trigger::Trigger;
 use crate::raft_state::IOId;
+use crate::raft_state::MembershipState;
 use crate::storage::RaftLogStorage;
 use crate::storage::RaftStateMachine;
 use crate::storage::Snapshot;
+use crate::storage::SnapshotMeta;
 use crate::type_config::TypeConfigExt;
 use crate::type_config::alias::JoinErrorOf;
 use crate::type_config::alias::LogIdOf;
@@ -137,6 +139,8 @@ use crate::vote::leader_id::raft_leader_id::RaftLeaderIdExt;
 use crate::vote::non_committed::UncommittedVote;
 use crate::vote::raft_vote::RaftVote;
 use crate::vote::raft_vote::RaftVoteExt;
+use crate::ServerState;
+use crate::engine::LogIdList;
 
 /// Define types for a Raft type configuration.
 ///
@@ -231,6 +235,68 @@ macro_rules! declare_raft_types {
 
         }
     };
+}
+
+/// A snapshot of the internal state of a Raft node.
+///
+/// This struct provides a point-in-time view of the most important state variables
+/// of a Raft node, useful for invariant checking in deterministic simulations.
+#[derive(Debug, Clone)]
+pub struct RaftStateSnapshot<C>
+where C: RaftTypeConfig
+{
+    /// The current node ID.
+    pub node_id: C::NodeId,
+
+    /// The current vote of this node.
+    pub vote: VoteOf<C>,
+
+    /// All log ids this node has.
+    pub log_ids: LogIdList<C>,
+
+    /// The latest cluster membership configuration found, in log or in state machine.
+    pub membership_state: MembershipState<C>,
+
+    /// The state of a Raft node, such as Leader or Follower.
+    pub server_state: ServerState,
+
+    /// The log id up to which the state machine has applied.
+    pub accepted: Option<LogIdOf<C>>,
+
+    /// The log id up to which the state machine has been flushed to storage.
+    pub applied: Option<LogIdOf<C>>,
+
+    /// The log id up to which the logs have been committed.
+    pub committed: Option<LogIdOf<C>>,
+
+    /// Metadata of the last snapshot.
+    pub snapshot_meta: SnapshotMeta<C>,
+
+    /// The purged log id.
+    pub purged: Option<LogIdOf<C>>,
+}
+
+impl<C> RaftStateSnapshot<C>
+where C: RaftTypeConfig
+{
+    pub fn new_initial(node_id: C::NodeId) -> Self {
+        Self {
+            node_id: node_id.clone(),
+            vote: VoteOf::<C>::new_with_default_term(node_id),
+            log_ids: LogIdList::default(),
+            membership_state: MembershipState::default(),
+            server_state: ServerState::default(),
+            accepted: None,
+            applied: None,
+            committed: None,
+            snapshot_meta: SnapshotMeta::default(),
+            purged: None,
+        }
+    }
+
+    pub fn is_leader(&self) -> bool {
+        self.server_state == ServerState::Leader
+    }
 }
 
 /// Policy that determines how to handle read operations in a Raft cluster.
@@ -434,9 +500,7 @@ where C: RaftTypeConfig
         let (tx_metrics, rx_metrics) = C::watch_channel(RaftMetrics::new_initial(id.clone()));
         let (tx_data_metrics, rx_data_metrics) = C::watch_channel(RaftDataMetrics::default());
         let (tx_server_metrics, rx_server_metrics) = C::watch_channel(RaftServerMetrics::new_initial(id.clone()));
-
-        // Watch channel for IO completion notifications from storage callbacks.
-        // Initial value is a dummy IOId with this node's ID.
+        let (tx_state, rx_state) = C::watch_channel(RaftStateSnapshot::new_initial(id.clone()));
         let leader_id = C::LeaderId::new_with_default_term(id.clone());
         let dummy_io_id = IOId::Vote(UncommittedVote::new(leader_id));
         let (tx_io_completed, rx_io_completed) = C::watch_channel(Ok(dummy_io_id));
@@ -522,6 +586,7 @@ where C: RaftTypeConfig
             tx_metrics,
             tx_data_metrics,
             tx_server_metrics,
+            tx_state,
             tx_progress,
 
             runtime_stats: RuntimeStats::new(),
@@ -546,6 +611,7 @@ where C: RaftTypeConfig
             rx_metrics,
             rx_data_metrics,
             rx_server_metrics,
+            rx_state,
             progress_watcher,
             tx_shutdown: Mutex::new(Some(tx_shutdown)),
             core_state: Mutex::new(CoreState::Running(core_handle)),
@@ -1190,6 +1256,16 @@ where C: RaftTypeConfig
             responder: None,
             expected_leader: None,
         }
+    }
+
+    /// Provides synchronous access to the latest state of the Raft node.
+    ///
+    /// This returns a watched value that is updated every time the Raft node's internal state changes.
+    /// It is intended for use in deterministic simulations (like `turmoil`) to check invariants
+    /// after each simulation step.
+    #[since(version = "0.10.0")]
+    pub fn state_snapshot(&self) -> RaftStateSnapshot<C> {
+        self.inner.rx_state.borrow_watched().clone()
     }
 
     /// Handle the LeaderTransfer request from a Leader node.

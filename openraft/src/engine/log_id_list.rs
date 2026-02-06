@@ -159,7 +159,7 @@ where C: RaftTypeConfig
     }
 
     /// Get the last purged log id, if any.
-    pub(crate) fn purged(&self) -> Option<&LogIdOf<C>> {
+    pub fn purged(&self) -> Option<&LogIdOf<C>> {
         self.purged.as_ref()
     }
 
@@ -300,9 +300,8 @@ where C: RaftTypeConfig
         self.purged = Some(upto.clone());
     }
 
-    // This method is only used in tests
-    #[allow(dead_code)]
-    pub(crate) fn get(&self, index: u64) -> Option<LogIdOf<C>> {
+    /// Get the log id at the specified index.
+    pub fn get(&self, index: u64) -> Option<LogIdOf<C>> {
         self.ref_at(index).map(|r| r.into_log_id())
     }
 
@@ -365,7 +364,7 @@ where C: RaftTypeConfig
         Some(RefLogId::new(first_key.committed_leader_id(), first_index))
     }
 
-    pub(crate) fn last(&self) -> Option<&LogIdOf<C>> {
+    pub fn last(&self) -> Option<&LogIdOf<C>> {
         self.key_log_ids.last().or(self.purged.as_ref())
     }
 

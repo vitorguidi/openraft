@@ -9,6 +9,7 @@ use crate::Config;
 use crate::Extensions;
 use crate::OptionalSend;
 use crate::RaftMetrics;
+use crate::raft::RaftStateSnapshot;
 use crate::RaftTypeConfig;
 use crate::async_runtime::MpscSender;
 use crate::async_runtime::watch::WatchReceiver;
@@ -45,6 +46,7 @@ where C: RaftTypeConfig
     pub(in crate::raft) rx_metrics: WatchReceiverOf<C, RaftMetrics<C>>,
     pub(in crate::raft) rx_data_metrics: WatchReceiverOf<C, RaftDataMetrics<C>>,
     pub(in crate::raft) rx_server_metrics: WatchReceiverOf<C, RaftServerMetrics<C>>,
+    pub(in crate::raft) rx_state: WatchReceiverOf<C, RaftStateSnapshot<C>>,
     pub(in crate::raft) progress_watcher: IoProgressWatcher<C>,
 
     pub(in crate::raft) tx_shutdown: Mutex<Option<OneshotSenderOf<C, ()>>>,
