@@ -6,7 +6,7 @@ metadata:
   labels:
     app: detsim-orchestrator
 spec:
-  replicas: 1
+  replicas: 90
   selector:
     matchLabels:
       app: detsim-orchestrator
@@ -18,7 +18,7 @@ spec:
       serviceAccountName: detsim-sa
       containers:
       - name: orchestrator
-        image: gcr.io/vitorguidi-sandbox/openraft-detsim:buggy_leader
+        image: gcr.io/vitorguidi-sandbox/openraft-detsim:latest
         imagePullPolicy: IfNotPresent
         resources:
           requests:
