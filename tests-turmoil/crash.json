@@ -1,0 +1,25 @@
+{
+  "base_seed": 1770359525803999890,
+  "config": {
+    "chaos_interval": 4787,
+    "election_timeout_max": 399,
+    "election_timeout_min": 177,
+    "enable_chaos": true,
+    "fail_rate": 0.0,
+    "heartbeat_interval": 59,
+    "max_potential_nodes": 10,
+    "membership_interval": 13421,
+    "num_initial_nodes": 3,
+    "restart_chance": 0.019587005532734212
+  },
+  "iteration": 0,
+  "iteration_seed": 1770359525803999890,
+  "max_steps": 10000000,
+  "reproduce": {
+    "command": "cargo run --bin fuzz -- --reproduce 1770359525803999890 --max-steps 10000000 --crash-file crash.json",
+    "iteration_seed": 1770359525803999890,
+    "max_steps": 10000000
+  },
+  "steps_completed": 14521,
+  "violation": "Step 14521: MultipleLeadersInTerm { term: 2, leaders: [6, 8, 10] }"
+}

@@ -225,6 +225,9 @@ where C: RaftTypeConfig
         });
 
         self.server_state_handler().update_server_state_if_changed();
+
+        // GROTESQUE BUG: Become leader immediately without waiting for quorum
+        self.establish_leader();
     }
 
     pub(crate) fn leader_ref(&self) -> Option<&Leader<C, LeaderQuorumSet<C>>> {

@@ -1,0 +1,25 @@
+{
+  "base_seed": 1770359447552723602,
+  "config": {
+    "chaos_interval": 2174,
+    "election_timeout_max": 602,
+    "election_timeout_min": 132,
+    "enable_chaos": true,
+    "fail_rate": 0.0,
+    "heartbeat_interval": 66,
+    "max_potential_nodes": 10,
+    "membership_interval": 21637,
+    "num_initial_nodes": 3,
+    "restart_chance": 0.04882271241497794
+  },
+  "iteration": 0,
+  "iteration_seed": 1770359447552723602,
+  "max_steps": 10000000,
+  "reproduce": {
+    "command": "cargo run --bin fuzz -- --reproduce 1770359447552723602 --max-steps 10000000 --crash-file reproduction_crash.json",
+    "iteration_seed": 1770359447552723602,
+    "max_steps": 10000000
+  },
+  "steps_completed": 2278,
+  "violation": "Step 2278: LeaderMissingCommitted { term: 2, leader: 5, missing_index: 9 }"
+}
